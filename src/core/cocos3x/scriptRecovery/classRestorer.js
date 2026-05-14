@@ -96,11 +96,24 @@ function foldExtendsIife(ast) {
       if (!t.isIdentifier(decl.id) || !decl.init) return;
 
       const className = decl.id.name;
-      const match = matchExtendsIife(decl.init, className);
-      if (!match) return;
+      let match = matchExtendsIife(decl.init, className);
+      let innerCtorName = className;
+      let helperIdx = 0;
+      if (!match) {
+        // Fallback: outer var name differs from inner ctor name, e.g.
+        //   var xt = function(t){ function n(e,i){...} e(n,t); i(n,[...]); return n; }(d);
+        // Webcrack's babel-loose output for minified bundles regularly emits this
+        // shape — `n` is the inner ctor while `xt` is the user-visible binding.
+        // Treat it as `class xt extends d { ... }`.
+        const anon = matchAnonExtendsIife(decl.init);
+        if (!anon) return;
+        match = anon;
+        innerCtorName = anon.innerCtorName;
+        helperIdx = anon.helperIdx;
+      }
 
       const { superExpr, fnBody, superParamName } = match;
-      const members = buildClassMembers(fnBody, className, superParamName, [0]);
+      const members = buildClassMembers(fnBody, innerCtorName, superParamName, [helperIdx]);
       if (members === null) return; // structure didn't match expectations; skip
 
       const classDecl = t.classDeclaration(
