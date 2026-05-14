@@ -90,6 +90,23 @@ export function createClass(Constructor: any, protoProps?: any[], staticProps?: 
   return Constructor;
 }
 
+// \`construct(Parent, args)\` — babel-loose helper for forwarding spread args
+// to a base-class constructor without violating ES6 \`super\` rules. Used by
+// crypto-js bundles (e.g. core.ts: \`return construct(this, args)\`).
+// Behaves like \`Reflect.construct(Parent, args, this.constructor)\` but
+// returns an instance whose prototype chain points at \`this.constructor\` —
+// matching the @babel/runtime emit for "loose: true".
+export function construct(Parent: any, args: any[], NewTarget?: any) {
+  if (typeof Reflect !== 'undefined' && Reflect.construct) {
+    return Reflect.construct(Parent, args, NewTarget || Parent);
+  }
+  // Fallback: invoke as a normal call. Reasonable for ES5 base classes.
+  const a = [null].concat(args as any);
+  // eslint-disable-next-line prefer-spread
+  const instance = new (Function.prototype.bind.apply(Parent, a as any))();
+  return instance;
+}
+
 export function asyncToGenerator(fn: (...args: any[]) => any) {
   return function (this: any) {
     const self = this;

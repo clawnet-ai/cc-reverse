@@ -41,6 +41,29 @@ describe('Layer 2: esmRebuilder', () => {
     expect(result).toBeNull();
   });
 
+  it('injects _context shim when factory body references contextParam', async () => {
+    const src = `
+      System.register("chunks:///_virtual/clipper.ts",[],
+        (function(e,t){var n=t.meta.url;return{setters:[],execute:function(){var u=t.meta.url;}}}));
+    `;
+    const [mod] = await splitChunks({ name: 'clipper.js', source: src });
+    const ast = await rebuildEsm(mod.ast, mod);
+    const code = generate(ast).code;
+    expect(mod.contextParam).toBe('t');
+    expect(code).toMatch(/const\s+t\s*=\s*\{[\s\S]*meta:\s*\{[\s\S]*url:\s*import\.meta\.url/);
+  });
+
+  it('does not inject _context shim when contextParam is unreferenced', async () => {
+    const src = `
+      System.register("chunks:///_virtual/x.ts",["cc"],
+        (function(e,t){var c;return{setters:[function(x){c=x.cclegacy}],execute:function(){c.foo();}}}));
+    `;
+    const [mod] = await splitChunks({ name: 'x.js', source: src });
+    const ast = await rebuildEsm(mod.ast, mod);
+    const code = generate(ast).code;
+    expect(code).not.toMatch(/const\s+t\s*=\s*\{[\s\S]*import\.meta\.url/);
+  });
+
   it('emits `import * as local` for namespace bindings', async () => {
     // SQConfig.ts setter shape: `function(t){ o = t }` — whole module object.
     const src = `
