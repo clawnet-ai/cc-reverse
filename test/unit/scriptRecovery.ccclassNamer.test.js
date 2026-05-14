@@ -117,6 +117,35 @@ describe('Layer 4: ccclassNamer', () => {
     expect(code).not.toMatch(/_RF\.(push|pop)/);
   });
 
+  it('renames colliding namespace export so the class can claim the public name', async () => {
+    // Mimics post-classRestorer state for files like GameKeyMgr.ts:
+    //   - `class u extends Event` (class-restorer left it as `u`)
+    //   - sibling `export let GameKeyMgr = { EventType: u, ... }` namespace
+    // _RF.push announces the class should be named `GameKeyMgr`. Without
+    // collision-handling, both `class GameKeyMgr` and `let GameKeyMgr` end
+    // up at top level and the engine refuses to parse the module.
+    const src = `
+      import { Event } from 'cc';
+      cclegacy._RF.push({}, "uuid-aaaa", "GameKeyMgr", undefined);
+      class u extends Event { constructor(e) { super(e); } }
+      export { u as EventType };
+      export let GameKeyMgr = { EventType: u, allKey: [] };
+    `;
+    const mod = makeModule(src);
+    const out = await applyCcclassNames([mod]);
+    expect(out[0].ccclassName).toBe('GameKeyMgr');
+    const code = generate(out[0].ast).code;
+    expect(code).toMatch(/class\s+GameKeyMgr\s+extends\s+Event/);
+    // The namespace object must lose its public name (renamed locally) and
+    // its export wrapper must be dropped — the class is the public one.
+    expect(code).not.toMatch(/export\s+let\s+GameKeyMgr\b/);
+    expect(code).toMatch(/let\s+GameKeyMgrNs\b/);
+    // Internal references to the original `u` should be redirected to the
+    // class — `EventType: u` becomes `EventType: GameKeyMgr` inside the
+    // namespace object literal.
+    expect(code).toMatch(/EventType:\s*GameKeyMgr/);
+  });
+
   it('passthrough: module without class is unchanged and has null fields', async () => {
     const mod = { name: 'plain', ast: parse('var x = 1;', { sourceType: 'module' }), deps: [], setterBindings: [], source: 'var x = 1;' };
     const out = await applyCcclassNames([mod]);

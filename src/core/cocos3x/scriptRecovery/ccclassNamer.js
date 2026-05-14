@@ -92,6 +92,48 @@ function extractCcclassDecoratorName(ast) {
 }
 
 function renameClassId(ast, newName) {
+  // First pass: if some other top-level binding already owns `newName`
+  // (typical case: webcrack restored a sibling `export let GameKeyMgr = {
+  // EventType: u, ...}` namespace alongside `var u = (IIFE)`), rename the
+  // colliding binding to a deconflicted local name and rewrite its export
+  // so the public name `newName` remains exported by the class. Otherwise
+  // the engine fails parse with 'Identifier already declared'.
+  traverse(ast, {
+    Program(programPath) {
+      const programScope = programPath.scope;
+      const existing = programScope.getOwnBinding(newName);
+      if (!existing) return;
+
+      let candidate = newName + 'Ns';
+      let n = 2;
+      while (programScope.hasBinding(candidate)) {
+        candidate = newName + 'Ns' + n++;
+      }
+
+      // Locate the offending declaration before renaming, so we can
+      // convert `export let X = {...}` into `let X = {...}` (dropping the
+      // export) — the class declaration will provide the public X.
+      const bindingPath = existing.path;
+      const declStmtPath = bindingPath && bindingPath.parentPath;
+      const exportWrapper = declStmtPath && declStmtPath.parentPath;
+      const wrapsExport = exportWrapper && exportWrapper.isExportNamedDeclaration();
+
+      try {
+        programScope.rename(newName, candidate);
+      } catch (_e) {
+        return;
+      }
+
+      // After rename, the binding's identifier is `candidate`. If it was
+      // wrapped in `export let ...`, unwrap so we don't double-export
+      // `newName` (the class wins as the public binding).
+      if (wrapsExport && exportWrapper.node && exportWrapper.node.declaration) {
+        const inner = exportWrapper.node.declaration;
+        try { exportWrapper.replaceWith(inner); } catch (_e) { /* best-effort */ }
+      }
+    },
+  });
+
   traverse(ast, {
     ClassDeclaration(p) {
       if (!p.node.id || p.node.id.name === newName) return;
