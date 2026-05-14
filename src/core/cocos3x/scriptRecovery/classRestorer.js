@@ -99,8 +99,8 @@ function foldExtendsIife(ast) {
       const match = matchExtendsIife(decl.init, className);
       if (!match) return;
 
-      const { superExpr, fnBody } = match;
-      const members = buildClassMembers(fnBody, className);
+      const { superExpr, fnBody, superParamName } = match;
+      const members = buildClassMembers(fnBody, className, superParamName, [0]);
       if (members === null) return; // structure didn't match expectations; skip
 
       const classDecl = t.classDeclaration(
@@ -116,7 +116,73 @@ function foldExtendsIife(ast) {
       }
       path.replaceWith(classDecl);
     },
+
+    // Anonymous IIFE-class wrapped in `new`:
+    //   var X = new (function(_super){ <helper>(__c, _super); function __c(){...}
+    //                                   __c.prototype.m = ...; return __c; }(Super))();
+    // Here `X` is an instance of an anonymous subclass. Replace the inner
+    // CallExpression with a ClassExpression so the outer `new ()` invokes a
+    // real ES6 class — required because `_super.apply(this, args)` throws
+    // 'cannot be invoked without new' against an ES6 base class.
+    NewExpression(path) {
+      const callee = unwrapParen(path.node.callee);
+      // We need a CallExpression of an IIFE that returns the ctor function.
+      if (!t.isCallExpression(callee)) return;
+      const innerMatch = matchAnonExtendsIife(callee);
+      if (!innerMatch) return;
+      const { superExpr, fnBody, superParamName, innerCtorName, helperIdx } = innerMatch;
+      const members = buildClassMembers(fnBody, innerCtorName, superParamName, [helperIdx]);
+      if (members === null) return;
+      const classExpr = t.classExpression(
+        null,
+        superExpr,
+        t.classBody(members),
+      );
+      path.node.callee = classExpr;
+    },
   });
+}
+
+// Variant of matchExtendsIife for the anonymous case: the IIFE body declares
+// an inner ctor (any name) instead of using the outer `var X`.
+function matchAnonExtendsIife(initRaw) {
+  const init = unwrapParen(initRaw);
+  if (!t.isCallExpression(init)) return null;
+  if (init.arguments.length !== 1) return null;
+  const superExpr = init.arguments[0];
+
+  const callee = unwrapParen(init.callee);
+  if (!t.isFunctionExpression(callee)) return null;
+  if (callee.params.length !== 1 || !t.isIdentifier(callee.params[0])) return null;
+  const superParamName = callee.params[0].name;
+
+  const body = callee.body.body;
+  if (body.length < 2) return null;
+
+  // Last statement: return <innerCtor>;
+  const last = body[body.length - 1];
+  if (!t.isReturnStatement(last)) return null;
+  if (!t.isIdentifier(last.argument)) return null;
+  const innerCtorName = last.argument.name;
+
+  // Scan for the helper call <helper>(<innerCtor>, <superParam>) anywhere in the body.
+  // The minified anonymous form often emits `function i(){}` first, then `e(i,t);`.
+  let helperIdx = -1;
+  for (let i = 0; i < body.length - 1; i++) {
+    const s = body[i];
+    if (!t.isExpressionStatement(s)) continue;
+    const fc = s.expression;
+    if (!t.isCallExpression(fc)) continue;
+    if (!t.isIdentifier(fc.callee)) continue;
+    if (fc.arguments.length !== 2) continue;
+    if (!t.isIdentifier(fc.arguments[0], { name: innerCtorName })) continue;
+    if (!t.isIdentifier(fc.arguments[1], { name: superParamName })) continue;
+    helperIdx = i;
+    break;
+  }
+  if (helperIdx < 0) return null;
+
+  return { superExpr, fnBody: body, superParamName, innerCtorName, helperIdx };
 }
 
 function unwrapParen(node) {
@@ -134,38 +200,49 @@ function matchExtendsIife(initRaw, className) {
 
   const callee = unwrapParen(init.callee);
   if (!t.isFunctionExpression(callee)) return null;
-  if (callee.params.length !== 1 || !t.isIdentifier(callee.params[0], { name: '_super' })) return null;
+  if (callee.params.length !== 1 || !t.isIdentifier(callee.params[0])) return null;
+  // The IIFE's parameter is the "_super" placeholder. In unminified webpack
+  // output it's literally `_super`; in minified bundles webcrack didn't
+  // rename it, so it's a single-letter identifier (e.g. `t`). Match against
+  // whatever the function declared, then verify the body uses that same name.
+  const superParamName = callee.params[0].name;
 
   const body = callee.body.body;
   if (body.length < 2) return null;
 
-  // First statement: __extends(<className>, _super);
+  // First statement: <extendsHelper>(<className>, <superParamName>);
+  // The helper itself may be `__extends` (TS), `_extends`, `__inherits`,
+  // or — in minified bundles — a single-letter identifier (e.g. `e`).
+  // We don't validate the helper name; the (className, superParam) shape
+  // and the trailing `return <className>;` are sufficient signal.
   const first = body[0];
   if (!t.isExpressionStatement(first)) return null;
   const fcall = first.expression;
   if (!t.isCallExpression(fcall)) return null;
-  if (!t.isIdentifier(fcall.callee, { name: '__extends' })) return null;
+  if (!t.isIdentifier(fcall.callee)) return null;
   if (fcall.arguments.length !== 2) return null;
   if (!t.isIdentifier(fcall.arguments[0], { name: className })) return null;
-  if (!t.isIdentifier(fcall.arguments[1], { name: '_super' })) return null;
+  if (!t.isIdentifier(fcall.arguments[1], { name: superParamName })) return null;
 
   // Last statement: return <className>;
   const last = body[body.length - 1];
   if (!t.isReturnStatement(last)) return null;
   if (!t.isIdentifier(last.argument, { name: className })) return null;
 
-  return { superExpr, fnBody: body };
+  return { superExpr, fnBody: body, superParamName };
 }
 
-function buildClassMembers(fnBody, className) {
+function buildClassMembers(fnBody, className, superParamName, skipIdxList) {
   const members = [];
-  // Iterate the IIFE body skipping the leading __extends and trailing return.
-  for (let i = 1; i < fnBody.length - 1; i++) {
+  const skip = new Set(skipIdxList || []);
+  // Iterate the IIFE body skipping the trailing return and any helper-call indices.
+  for (let i = 0; i < fnBody.length - 1; i++) {
+    if (skip.has(i)) continue;
     const stmt = fnBody[i];
 
     // Constructor: `function ClassName(params) { body }`
     if (t.isFunctionDeclaration(stmt) && stmt.id && stmt.id.name === className) {
-      if (isPureSuperForwarder(stmt.body, stmt.params)) continue; // omit, default ctor suffices
+      if (isPureSuperForwarder(stmt.body, stmt.params, superParamName)) continue; // omit, default ctor suffices
       const ctor = t.classMethod(
         'constructor',
         t.identifier('constructor'),
@@ -208,13 +285,13 @@ function buildClassMembers(fnBody, className) {
   return members;
 }
 
-function isPureSuperForwarder(blockBody, params) {
+function isPureSuperForwarder(blockBody, params, superParamName) {
   const stmts = blockBody.body;
   if (stmts.length !== 1) return false;
   const ret = stmts[0];
   if (!t.isReturnStatement(ret) || !ret.argument) return false;
 
-  // Accept `_super.<call|apply>(...) || this`
+  // Accept `<superParam>.<call|apply>(...) || this`
   let expr = ret.argument;
   if (t.isLogicalExpression(expr, { operator: '||' }) && t.isThisExpression(expr.right)) {
     expr = expr.left;
@@ -223,7 +300,7 @@ function isPureSuperForwarder(blockBody, params) {
   const callee = expr.callee;
   if (
     !t.isMemberExpression(callee) ||
-    !t.isIdentifier(callee.object, { name: '_super' }) ||
+    !t.isIdentifier(callee.object, { name: superParamName }) ||
     !t.isIdentifier(callee.property)
   ) return false;
   const method = callee.property.name;
