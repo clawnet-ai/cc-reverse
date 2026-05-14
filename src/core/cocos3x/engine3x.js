@@ -254,9 +254,16 @@ async function writeAssetMeta(filePath, opts) {
   if (extras && typeof extras === 'object') Object.assign(userData, extras);
   // Bump per-importer ver so the editor doesn't run legacy migration chains
   // against our recovered docs. cc.Material's chain (1.0.7 → 1.0.21) crashes
-  // on the rehydrated array form; emitting at the latest ver matches the
-  // engine's own builtin material metas and short-circuits the migrators.
-  const ver = klass === 'cc.Material' ? '1.0.21' : '1.0.0';
+  // on the rehydrated array form; cc.SceneAsset's chain (... → 1.0.22)
+  // crashes with "Cannot read __type__" on the recovered scene shape.
+  // Emitting at the latest ver matches the engine's own builtin metas and
+  // short-circuits the migrators.
+  const META_VER = {
+    'cc.Material': '1.0.21',
+    'cc.SceneAsset': '1.1.50',
+    'cc.Prefab': '1.1.50',
+  };
+  const ver = META_VER[klass] || '1.0.0';
   const meta = {
     ver,
     importer,
