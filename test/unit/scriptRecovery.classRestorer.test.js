@@ -85,6 +85,29 @@ describe('Layer 3: classRestorer', () => {
     expect(code).not.toMatch(/e\(i,\s*t\)/);
   });
 
+  it('collapses var X = (IIFE)(Super) where inner ctor name differs from outer var', async () => {
+    // Webcrack-output for minified bundles often emits
+    //   var xt = function(t){ function n(e,i){...} e(n,t); ...; return n; }(d);
+    // — outer var `xt`, inner ctor `n`. Without folding, the leftover
+    // `e(n,t)`/`i(n,[...])` calls reference helpers that are out of scope at
+    // runtime and throw `ReferenceError: e is not defined`.
+    const src = `
+      var xt = function (t) {
+        function n(a, b) { return t.call(this, a, b) || this; }
+        e(n, t);
+        n.prototype.captureTouch = function () { return this; };
+        i(n, [{ key: "sender", get: function () { return this; } }]);
+        return n;
+      }(BaseClass);
+    `;
+    const ast = parse(src, { sourceType: 'module' });
+    const out = await restoreClasses(ast, { name: 'xt', preminified: true });
+    const code = generate(out).code;
+    expect(code).toMatch(/class\s+xt\s+extends\s+BaseClass/);
+    expect(code).toMatch(/captureTouch/);
+    expect(code).not.toMatch(/e\(n,\s*t\)/);
+  });
+
   it('passthrough on null ast', async () => {
     expect(await restoreClasses(null, { name: 'x' })).toBeNull();
   });
