@@ -45,6 +45,46 @@ describe('Layer 3: classRestorer', () => {
     expect(code).not.toMatch(/__decorate/);
   });
 
+  it('collapses minified __extends IIFE (single-letter helper + super param)', async () => {
+    // Mimics webcrack-output for a minified bundle: helper renamed to `e`,
+    // _super renamed to `t`. classRestorer must derive superParamName from
+    // the function's actual first param rather than literal '_super'.
+    const src = `
+      var Player = (function (t) {
+        e(Player, t);
+        function Player() { return t.apply(this, arguments) || this; }
+        Player.prototype.onLoad = function () { console.log('p'); };
+        return Player;
+      }(Component));
+    `;
+    const ast = parse(src, { sourceType: 'module' });
+    const out = await restoreClasses(ast, { name: 'Player', preminified: true });
+    const code = generate(out).code;
+    expect(code).toMatch(/class\s+Player\s+extends\s+Component/);
+    expect(code).toMatch(/onLoad\s*\(\s*\)/);
+    expect(code).not.toMatch(/e\(Player/);
+  });
+
+  it('rewrites anonymous IIFE-class instantiation to native class', async () => {
+    // var Ve = new (function(t){ function i(){return t.apply(this,arguments)||this}
+    //                            e(i,t); i.prototype.m = function(){}; return i; }(Super))();
+    // Without rewrite, `new (Super)()` via apply throws on ES6 base classes.
+    const src = `
+      var Ve = new (function (t) {
+        function i() { return t.apply(this, arguments) || this; }
+        e(i, t);
+        i.prototype.getSpriteFrame = function (n) { return n; };
+        return i;
+      }(SpriteAtlas))();
+    `;
+    const ast = parse(src, { sourceType: 'module' });
+    const out = await restoreClasses(ast, { name: 'mod', preminified: true });
+    const code = generate(out).code;
+    expect(code).toMatch(/new\s+class\s+extends\s+SpriteAtlas/);
+    expect(code).toMatch(/getSpriteFrame/);
+    expect(code).not.toMatch(/e\(i,\s*t\)/);
+  });
+
   it('passthrough on null ast', async () => {
     expect(await restoreClasses(null, { name: 'x' })).toBeNull();
   });
