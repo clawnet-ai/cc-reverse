@@ -208,8 +208,40 @@ async function writeAssetImport(filePath, content, className) {
     // failure surface tells us which effect the transformer doesn't handle.
     logger.debug(`effect transformer fallback (raw JSON) for ${filePath}`);
   }
+  if (className === 'cc.Material') {
+    const modern = modernizeMaterial(content);
+    if (modern) {
+      await writeFile(filePath, JSON.stringify(modern, null, 2));
+      return true;
+    }
+  }
   await writeFile(filePath, JSON.stringify(content, null, 2));
   return true;
+}
+
+// Convert a recovered cc.Material doc into the shape the 3.8 editor expects
+// (single object, modern field set with `_objFlags`, `_native`, `_techIdx`,
+// and `__expectedType__` on `_effectAsset`). Recovered docs come out of
+// rehydrate as `[{...}]`; the editor's importer then runs a 1.0.7→1.0.21
+// migration chain against that array shape and crashes on `__uuid__`. Mapping
+// to the modern shape up-front lets the importer skip the migrators.
+function modernizeMaterial(doc) {
+  const src = Array.isArray(doc) ? doc[0] : doc;
+  if (!src || src.__type__ !== 'cc.Material') return null;
+  const out = {
+    __type__: 'cc.Material',
+    _name: src._name || '',
+    _objFlags: src._objFlags || 0,
+    _native: src._native || '',
+    _effectAsset: src._effectAsset
+      ? { __uuid__: src._effectAsset.__uuid__, __expectedType__: 'cc.EffectAsset' }
+      : null,
+    _techIdx: typeof src._techIdx === 'number' ? src._techIdx : 0,
+    _defines: Array.isArray(src._defines) ? src._defines : [{}],
+    _states: Array.isArray(src._states) ? src._states : [{}],
+    _props: Array.isArray(src._props) ? src._props : [{}],
+  };
+  return out;
 }
 
 /**
@@ -220,8 +252,13 @@ async function writeAssetMeta(filePath, opts) {
   const importer = KLASS_TO_IMPORTER[klass] || 'unknown';
   const userData = { recoveredBy: 'cc-reverse' };
   if (extras && typeof extras === 'object') Object.assign(userData, extras);
+  // Bump per-importer ver so the editor doesn't run legacy migration chains
+  // against our recovered docs. cc.Material's chain (1.0.7 → 1.0.21) crashes
+  // on the rehydrated array form; emitting at the latest ver matches the
+  // engine's own builtin material metas and short-circuits the migrators.
+  const ver = klass === 'cc.Material' ? '1.0.21' : '1.0.0';
   const meta = {
-    ver: '1.0.0',
+    ver,
     importer,
     imported: true,
     uuid,
@@ -595,6 +632,20 @@ function resolveImportThroughRedirect(cfg, uuid, registry) {
 }
 
 async function unpackAsset({ cfg, uuid, info, bundleOut, verbose, bundleRegistry }) {
+  // Skip engine-owned assets that the editor ships under matching paths. The
+  // `internal` bundle's `default_materials/*.mtl` are owned by the engine at
+  // fixed long uuids; emitting our own copy collides ("uuid is already
+  // pointing to another asset") and triggers the legacy material migrator
+  // (1.0.7 → 1.0.21) on a doc shape it doesn't recognise. Symmetric to the
+  // builtin-effect skip in effectTransformer.
+  if (cfg && cfg.name === 'internal'
+      && info && info.type === 'cc.Material'
+      && cfg.paths && cfg.paths[uuid]
+      && typeof cfg.paths[uuid].path === 'string'
+      && /(^|\/)default_materials\//.test(cfg.paths[uuid].path)) {
+    return false;
+  }
+
   const importSrc = getImportPath(cfg, uuid, '.json');
   const importSrcCcon = getImportPath(cfg, uuid, '.cconb');
   const nativeExt = cfg.extensionMap[uuid] || null;
