@@ -180,4 +180,31 @@ describe('Layer 3: classRestorer', () => {
     // The alias-decl must not survive
     expect(code).not.toMatch(/var\s+s\s*=\s*h\.prototype/);
   });
+
+  it('lifts static assignments inside the IIFE onto the class as static members', async () => {
+    // CryptoJS attaches helpers like Hasher._createHelper on the constructor
+    // itself inside the IIFE body. They were dropped as "static assignments
+    // — drop in MVP", which made downstream `n._createHelper(h)` blow up at
+    // runtime with TypeError. Now they should be preserved as ES6 static
+    // class members.
+    const src = `
+      var __extends = function(d, b){};
+      var Hasher = (function (_super) {
+        __extends(Hasher, _super);
+        function Hasher() { return _super.apply(this, arguments) || this; }
+        Hasher._createHelper = function (algo) { return function (msg, key) { return new algo(key).finalize(msg); }; };
+        Hasher._XFORM_MODE = 1;
+        var s = Hasher.prototype;
+        s.reset = function () { this._x = 0; };
+        return Hasher;
+      }(BaseAlgo));
+    `;
+    const ast = parse(src, { sourceType: 'module' });
+    const out = await restoreClasses(ast, { name: 'Hasher' });
+    const code = generate(out).code;
+    expect(code).toMatch(/class\s+Hasher\s+extends\s+BaseAlgo/);
+    expect(code).toMatch(/static\s+_createHelper\s*\(\s*algo\s*\)/);
+    expect(code).toMatch(/static\s+_XFORM_MODE\s*=\s*1/);
+    expect(code).toMatch(/reset\s*\(\s*\)/);
+  });
 });

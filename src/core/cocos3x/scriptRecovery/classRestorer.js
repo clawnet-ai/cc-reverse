@@ -350,7 +350,42 @@ function buildClassMembers(fnBody, className, superParamName, skipIdxList) {
         // non-function prototype fields: drop in MVP
         continue;
       }
-      // static assignments like `ClassName.foo = ...` — drop in MVP.
+      // Static assignment: `ClassName.<name> = <value>;` — these were dropped
+      // before, but CryptoJS attaches critical helpers (e.g. Hasher._createHelper,
+      // Cipher._createHelper, Cipher._ENC_XFORM_MODE) on the constructor itself.
+      // Without them downstream calls like `Hasher._createHelper(MD5Algo)` blow
+      // up at runtime with "TypeError: ..._createHelper is not a function".
+      if (
+        t.isMemberExpression(left) &&
+        !left.computed &&
+        t.isIdentifier(left.object, { name: className }) &&
+        t.isIdentifier(left.property)
+      ) {
+        if (t.isFunctionExpression(right)) {
+          const methodBody = rewriteMethodBody(right.body, superParamName, left.property.name);
+          const method = t.classMethod(
+            'method',
+            t.identifier(left.property.name),
+            right.params,
+            methodBody,
+            false, // computed
+            true,  // static
+          );
+          members.push(method);
+        } else {
+          // Static data field (e.g. `Cipher._ENC_XFORM_MODE = 1;`).
+          const field = t.classProperty(
+            t.identifier(left.property.name),
+            right,
+            null,    // typeAnnotation
+            null,    // decorators
+            false,   // computed
+            true,    // static
+          );
+          members.push(field);
+        }
+        continue;
+      }
     }
 
     // Drop the `var alias = ClassName.prototype` declaration we already consumed
