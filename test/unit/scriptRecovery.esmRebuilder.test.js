@@ -64,6 +64,28 @@ describe('Layer 2: esmRebuilder', () => {
     expect(code).not.toMatch(/const\s+t\s*=\s*\{[\s\S]*import\.meta\.url/);
   });
 
+  it('emits `export { Y as X } from ...` for setter-level reexport bindings', async () => {
+    const src = `
+      System.register("chunks:///_virtual/index.ts",["./A.ts"],
+        (function(e){return{setters:[function(t){e("Foo",t.Bar)}],execute:function(){}}}));
+    `;
+    const [mod] = await splitChunks({ name: 'index.js', source: src });
+    const ast = await rebuildEsm(mod.ast, mod);
+    const code = generate(ast).code;
+    expect(code).toMatch(/export\s*\{\s*Bar\s+as\s+Foo\s*\}\s*from\s*['"]\.\/A['"]/);
+  });
+
+  it('emits `export * from` for bare namespace re-export setters', async () => {
+    const src = `
+      System.register("chunks:///_virtual/index.ts",["./A.ts"],
+        (function(e){return{setters:[function(t){e(t)}],execute:function(){}}}));
+    `;
+    const [mod] = await splitChunks({ name: 'index.js', source: src });
+    const ast = await rebuildEsm(mod.ast, mod);
+    const code = generate(ast).code;
+    expect(code).toMatch(/export\s*\*\s*from\s*['"]\.\/A['"]/);
+  });
+
   it('emits `import * as local` for namespace bindings', async () => {
     // SQConfig.ts setter shape: `function(t){ o = t }` — whole module object.
     const src = `

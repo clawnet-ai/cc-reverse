@@ -68,6 +68,42 @@ describe('Layer 1: chunkSplitter', () => {
     expect(out[0].contextParam).toBe('t');
   });
 
+  it('detects setter re-exports: _export("X", t.Y) → reexport binding', async () => {
+    const src = `
+      System.register("chunks:///_virtual/index.ts",["./A.ts"],
+        (function(e){return{setters:[function(t){e("Foo",t.Bar)}],execute:function(){}}}));
+    `;
+    const out = await splitChunks({ name: 'index.js', source: src });
+    expect(out[0].setterBindings).toEqual([
+      { dep: './A.ts', bindings: [{ reexport: true, exported: 'Foo', imported: 'Bar' }] },
+    ]);
+  });
+
+  it('folds `var o={};o.X=t.X;_export(o)` collector pattern into per-prop reexports', async () => {
+    const src = `
+      System.register("chunks:///_virtual/index.ts",["./A.ts"],
+        (function(e){return{setters:[function(t){var o={};o.X=t.X;o.Y=t.Z;e(o)}],execute:function(){}}}));
+    `;
+    const out = await splitChunks({ name: 'index.js', source: src });
+    expect(out[0].setterBindings).toEqual([
+      { dep: './A.ts', bindings: [
+        { reexport: true, exported: 'X', imported: 'X' },
+        { reexport: true, exported: 'Y', imported: 'Z' },
+      ] },
+    ]);
+  });
+
+  it('treats `_export(t)` (bare namespace re-export) as namespace reexport', async () => {
+    const src = `
+      System.register("chunks:///_virtual/index.ts",["./A.ts"],
+        (function(e){return{setters:[function(t){e(t)}],execute:function(){}}}));
+    `;
+    const out = await splitChunks({ name: 'index.js', source: src });
+    expect(out[0].setterBindings).toEqual([
+      { dep: './A.ts', bindings: [{ reexport: true, namespace: true }] },
+    ]);
+  });
+
   it('parses comma-list setter (SequenceExpression) into multiple bindings', async () => {
     // Minified setter: `function(e){i=e.cclegacy,n=e.Vec2}` — one statement,
     // two assignments comma-joined.

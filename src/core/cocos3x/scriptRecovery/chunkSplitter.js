@@ -82,7 +82,7 @@ async function splitChunks(chunk) {
       const contextParam = (factory.params && factory.params[1] && t.isIdentifier(factory.params[1]))
         ? factory.params[1].name
         : null;
-      const result = extractFactoryBody(factory);
+      const result = extractFactoryBody(factory, exportParam);
       const setterBindings = result.setterBindings.map((s) => ({
         dep: deps[s._index],
         bindings: s.bindings,
@@ -145,7 +145,7 @@ function factoryHasNestedRegister(factory) {
   return found;
 }
 
-function extractFactoryBody(factory) {
+function extractFactoryBody(factory, exportParam) {
   const out = { setterBindings: [], bodyAst: null };
   const ret = factory.body.body.find((s) => t.isReturnStatement(s));
   if (!ret || !t.isObjectExpression(ret.argument)) return out;
@@ -154,7 +154,7 @@ function extractFactoryBody(factory) {
     if (!t.isObjectProperty(prop) && !t.isObjectMethod(prop)) continue;
     const key = t.isIdentifier(prop.key) ? prop.key.name : (t.isStringLiteral(prop.key) ? prop.key.value : null);
     if (key === 'setters' && t.isObjectProperty(prop) && t.isArrayExpression(prop.value)) {
-      out.setterBindings = parseSetters(prop.value);
+      out.setterBindings = parseSetters(prop.value, exportParam);
     } else if (key === 'execute') {
       const fn = t.isObjectMethod(prop) ? prop : (t.isFunctionExpression(prop.value) || t.isArrowFunctionExpression(prop.value) ? prop.value : null);
       if (fn) {
@@ -166,7 +166,7 @@ function extractFactoryBody(factory) {
   return out;
 }
 
-function parseSetters(arrayExpr) {
+function parseSetters(arrayExpr, exportParam) {
   return arrayExpr.elements.map((fn, i) => {
     if (!t.isFunctionExpression(fn) && !t.isArrowFunctionExpression(fn)) {
       return { dep: null, bindings: [], _index: i };
@@ -175,14 +175,91 @@ function parseSetters(arrayExpr) {
     const paramName = t.isIdentifier(param) ? param.name : null;
     const bindings = [];
     if (paramName) {
+      // Collect identifiers locally assigned to an object expression and the
+      // properties added to them (`var o = {}; o.X = t.Y`). After the loop we
+      // know which `o`s are anonymous re-export collectors so we can fold
+      // `_export(o)` into per-property re-exports.
+      const collectors = new Map(); // name -> [{ exported, imported }]
       for (const stmt of fn.body.body) {
+        if (t.isVariableDeclaration(stmt)) {
+          for (const d of stmt.declarations) {
+            if (
+              t.isIdentifier(d.id) &&
+              t.isObjectExpression(d.init) &&
+              d.init.properties.length === 0
+            ) {
+              collectors.set(d.id.name, []);
+            }
+          }
+          continue;
+        }
         if (!t.isExpressionStatement(stmt)) continue;
-        // Setter may be a comma-list of assignments: `function(t){o=t.A,n=t.B}`
-        // which parses as a SequenceExpression. Normalise to a flat list.
         const exprs = t.isSequenceExpression(stmt.expression)
           ? stmt.expression.expressions
           : [stmt.expression];
         for (const e of exprs) {
+          // `o.Foo = t.Bar` — collector property assignment (preludes
+          // `_export(o)` later in the setter).
+          if (
+            t.isAssignmentExpression(e) &&
+            t.isMemberExpression(e.left) &&
+            !e.left.computed &&
+            t.isIdentifier(e.left.object) &&
+            collectors.has(e.left.object.name) &&
+            t.isIdentifier(e.left.property) &&
+            t.isMemberExpression(e.right) &&
+            t.isIdentifier(e.right.object, { name: paramName }) &&
+            (t.isIdentifier(e.right.property) || t.isStringLiteral(e.right.property))
+          ) {
+            const exported = e.left.property.name;
+            const imported = t.isIdentifier(e.right.property)
+              ? e.right.property.name
+              : e.right.property.value;
+            collectors.get(e.left.object.name).push({ exported, imported });
+            continue;
+          }
+          // `_export("Name", t.X)` — single named re-export.
+          if (
+            exportParam &&
+            t.isCallExpression(e) &&
+            t.isIdentifier(e.callee, { name: exportParam }) &&
+            e.arguments.length === 2 &&
+            t.isStringLiteral(e.arguments[0]) &&
+            t.isMemberExpression(e.arguments[1]) &&
+            t.isIdentifier(e.arguments[1].object, { name: paramName }) &&
+            (t.isIdentifier(e.arguments[1].property) || t.isStringLiteral(e.arguments[1].property))
+          ) {
+            const exported = e.arguments[0].value;
+            const importedNode = e.arguments[1].property;
+            const imported = t.isIdentifier(importedNode) ? importedNode.name : importedNode.value;
+            bindings.push({ reexport: true, exported, imported });
+            continue;
+          }
+          // `_export(o)` where `o` is a known collector — fold properties.
+          if (
+            exportParam &&
+            t.isCallExpression(e) &&
+            t.isIdentifier(e.callee, { name: exportParam }) &&
+            e.arguments.length === 1 &&
+            t.isIdentifier(e.arguments[0]) &&
+            collectors.has(e.arguments[0].name)
+          ) {
+            for (const r of collectors.get(e.arguments[0].name)) {
+              bindings.push({ reexport: true, exported: r.exported, imported: r.imported });
+            }
+            continue;
+          }
+          // `_export(t)` — re-export the whole namespace (`export * from`).
+          if (
+            exportParam &&
+            t.isCallExpression(e) &&
+            t.isIdentifier(e.callee, { name: exportParam }) &&
+            e.arguments.length === 1 &&
+            t.isIdentifier(e.arguments[0], { name: paramName })
+          ) {
+            bindings.push({ reexport: true, namespace: true });
+            continue;
+          }
           if (!t.isAssignmentExpression(e) || !t.isIdentifier(e.left)) continue;
           // `local = ns.prop` — named import binding.
           if (
@@ -197,12 +274,7 @@ function parseSetters(arrayExpr) {
             bindings.push({ local, imported });
             continue;
           }
-          // `local = ns` — whole-namespace receiver (SystemJS hands the entire
-          // module exports object to the setter). In ESM this is a namespace
-          // import: `import * as local from 'dep'`. Without this case the
-          // binding is silently dropped, leaving `local` undefined in the
-          // execute body — observed for SQConfig.ts which receives every
-          // SQLevelN.ts module as a whole namespace.
+          // `local = ns` — whole-namespace receiver (import * as local).
           if (t.isIdentifier(e.right, { name: paramName })) {
             bindings.push({ local: e.left.name, namespace: true });
             continue;
