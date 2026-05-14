@@ -27,6 +27,7 @@ async function rebuildEsm(ast, mod) {
   const program = ast.program;
   const newBody = [];
   const exportName = (mod && mod.exportParam) || '_export';
+  const exported = new Set();
 
   for (const setter of mod.setterBindings || []) {
     if (!setter.dep || !setter.bindings.length) continue;
@@ -34,7 +35,23 @@ async function rebuildEsm(ast, mod) {
     // separate `import * as local from '...'` declaration — ESM disallows
     // mixing a namespace specifier with named specifiers in one statement.
     const named = [];
+    const reexportNamed = [];
     for (const b of setter.bindings) {
+      // Re-export forms (`_export("X", t.Y)`, `_export(o)` with collected
+      // props, or `_export(t)` for namespace) come from setter bodies that
+      // forward dep values straight back out without locally binding them.
+      // Emit native ESM re-export syntax instead of import + manual export.
+      if (b.reexport) {
+        if (b.namespace) {
+          newBody.push(t.exportAllDeclaration(t.stringLiteral(normalizeDep(setter.dep))));
+        } else if (!exported.has(b.exported)) {
+          exported.add(b.exported);
+          reexportNamed.push(
+            t.exportSpecifier(t.identifier(b.imported), t.identifier(b.exported))
+          );
+        }
+        continue;
+      }
       if (b.namespace) {
         newBody.push(t.importDeclaration(
           [t.importNamespaceSpecifier(t.identifier(b.local))],
@@ -47,9 +64,13 @@ async function rebuildEsm(ast, mod) {
     if (named.length) {
       newBody.push(t.importDeclaration(named, t.stringLiteral(normalizeDep(setter.dep))));
     }
+    if (reexportNamed.length) {
+      newBody.push(
+        t.exportNamedDeclaration(null, reexportNamed, t.stringLiteral(normalizeDep(setter.dep)))
+      );
+    }
   }
 
-  const exported = new Set();
   for (const stmt of program.body) {
     if (t.isDirective(stmt)) continue;
 

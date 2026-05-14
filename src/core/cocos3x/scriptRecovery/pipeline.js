@@ -5,6 +5,7 @@ const { rebuildEsm: defaultRebuild } = require('./esmRebuilder');
 const { restoreClasses: defaultRestore } = require('./classRestorer');
 const { applyCcclassNames: defaultNamer } = require('./ccclassNamer');
 const { inferFieldTypes: defaultInferer } = require('./typeInferer');
+const { normalizePropertyTypes: defaultPropTypeNorm } = require('./propertyTypeNormalizer');
 const { emitTsProject: defaultEmitter } = require('./tsProjectEmitter');
 
 /**
@@ -23,6 +24,7 @@ async function runScriptRecoveryPipeline(input) {
   const restore = layers.classRestorer || defaultRestore;
   const namer = layers.ccclassNamer || defaultNamer;
   const inferer = layers.typeInferer || defaultInferer;
+  const propTypeNorm = layers.propertyTypeNormalizer || defaultPropTypeNorm;
   const emitter = layers.tsProjectEmitter; // emitter is opt-in (engine wires it)
   const errors = [];
 
@@ -57,6 +59,15 @@ async function runScriptRecoveryPipeline(input) {
     modules = (await inferer(modules, context)) || modules;
   } catch (err) {
     errors.push({ layer: 'typeInferer', message: err.message });
+  }
+
+  // Layer 4.5: drop `type: String|Number|Boolean` from @property decorator
+  // calls to silence Cocos editor warnings. Pure AST cleanup — placed after
+  // class restoration so it sees the alias `var $ = _decorator.property`.
+  try {
+    modules = (await propTypeNorm(modules, context)) || modules;
+  } catch (err) {
+    errors.push({ layer: 'propertyTypeNormalizer', message: err.message });
   }
 
   let emit = null;
