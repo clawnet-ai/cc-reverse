@@ -279,15 +279,20 @@ function splitProgramName(program) {
 }
 
 function buildPrograms(asset) {
+  // Collect property value lengths across all passes — used to downgrade
+  // UBO members that the compiler packed into vec4 slots back to their
+  // authored scalar/vec2/vec3 types so usage like `if (x < threshold)` keeps
+  // matching scalar arithmetic in GLSL.
+  const propLen = collectPropertyLengths(asset);
   const programs = [];
   for (const sh of asset.shaders || []) {
     const stages = splitProgramName(sh.name);
     const glsl = sh.glsl1 || sh.glsl3 || sh.glsl4 || {};
     if (stages.vert && glsl.vert) {
-      programs.push({ name: stages.vert.split(':')[0], body: postProcessGlsl(glsl.vert, sh) });
+      programs.push({ name: stages.vert.split(':')[0], body: postProcessGlsl(glsl.vert, sh, propLen) });
     }
     if (stages.frag && glsl.frag) {
-      programs.push({ name: stages.frag.split(':')[0], body: postProcessGlsl(glsl.frag, sh) });
+      programs.push({ name: stages.frag.split(':')[0], body: postProcessGlsl(glsl.frag, sh, propLen) });
     }
   }
   // Dedup by name (vert/frag from multiple shaders of the same effect repeat).
@@ -369,7 +374,37 @@ const UNIFORM_TO_CHUNK = (() => {
 // Only applies to non-sampler, non-block uniforms. Captures name in group 4.
 const BARE_UNIFORM_RE = /^([\t ]*)(?:layout\s*\([^)]*\)\s*)?uniform\s+(?:highp\s+|mediump\s+|lowp\s+)?(\w+)\s+(\w+)\s*(?:\[[^\]]*\])?\s*;[\t ]*$/;
 
-function postProcessGlsl(src, shader) {
+// Walk all passes' properties and record the authored value cardinality for
+// each property name — 1 → float, 2 → vec2, 3 → vec3, 4 → vec4, 9 → mat3,
+// 16 → mat4. Used to downgrade UBO members that std140 packing widened.
+function collectPropertyLengths(asset) {
+  const map = new Map();
+  for (const tech of asset.techniques || []) {
+    for (const pass of tech.passes || []) {
+      const props = pass.properties || {};
+      for (const [name, def] of Object.entries(props)) {
+        if (def && Array.isArray(def.value)) {
+          if (!map.has(name)) map.set(name, def.value.length);
+        }
+      }
+    }
+  }
+  return map;
+}
+
+function lengthToGlsl(len) {
+  switch (len) {
+    case 1: return 'float';
+    case 2: return 'vec2';
+    case 3: return 'vec3';
+    case 4: return 'vec4';
+    case 9: return 'mat3';
+    case 16: return 'mat4';
+    default: return null;
+  }
+}
+
+function postProcessGlsl(src, shader, propLen) {
   if (typeof src !== 'string' || !src) return src;
   const blocks = Array.isArray(shader && shader.blocks) ? shader.blocks : [];
   // Map each user-block-member name → owning block index, so we can drop
@@ -416,7 +451,17 @@ function postProcessGlsl(src, shader) {
   // first `precision …;` line so they appear at top-level uniform scope.
   const blockDecls = blocks.map((b) => {
     const members = (b.members || [])
-      .map((mm) => `  ${gfxTypeToGlsl(mm.type)} ${mm.name}${typeof mm.count === 'number' && mm.count > 1 ? `[${mm.count}]` : ''};`)
+      .map((mm) => {
+        // Prefer the authored property cardinality when the compiler widened
+        // a scalar/vec2/vec3 to vec4 for std140 packing. Without this, code
+        // like `if (color.a < alphaThreshold) discard;` triggers EFX2406
+        // because float < vec4 is a type mismatch.
+        const authored = propLen && propLen.get(mm.name);
+        const fromLen = authored ? lengthToGlsl(authored) : null;
+        const type = fromLen || gfxTypeToGlsl(mm.type);
+        const count = typeof mm.count === 'number' && mm.count > 1 ? `[${mm.count}]` : '';
+        return `  ${type} ${mm.name}${count};`;
+      })
       .join('\n');
     return `uniform ${b.name} {\n${members}\n};`;
   });
