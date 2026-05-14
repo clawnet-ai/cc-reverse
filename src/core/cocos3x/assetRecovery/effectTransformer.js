@@ -299,22 +299,71 @@ function buildPrograms(asset) {
   });
 }
 
-// Engine-provided builtin uniforms (cc-global, cc-local, cc-shadow includes).
-// The compiled glsl1 has these expanded as bare uniforms — Cocos's source
-// effect compiler rejects bare vector/matrix uniforms (EFX2201). We strip
-// them here and emit a `#include <legacy/cc-global>` so the editor's
-// preprocessor re-supplies the declarations from the engine's chunk library.
-const BUILTIN_UNIFORMS = new Set([
-  'cc_matView', 'cc_matProj', 'cc_matViewProj', 'cc_matViewInv', 'cc_matProjInv', 'cc_matViewProjInv',
-  'cc_matWorld', 'cc_matWorldIT', 'cc_matWorldView', 'cc_matWorldViewProj',
-  'cc_cameraPos', 'cc_screenSize', 'cc_nativeSize', 'cc_screenScale', 'cc_exposure',
-  'cc_time', 'cc_mainLitDir', 'cc_mainLitColor', 'cc_ambientSky', 'cc_ambientGround',
-  'cc_fogColor', 'cc_fogBase', 'cc_fogAdd', 'cc_nearFar', 'cc_viewPort',
-  'cc_matLightView', 'cc_matLightViewProj', 'cc_shadowInvProjDepthInfo',
-  'cc_shadowProjDepthInfo', 'cc_shadowProjInfo', 'cc_shadowNFLSInfo',
-  'cc_shadowWHPBInfo', 'cc_shadowLPNNInfo', 'cc_shadowColor', 'cc_planarNDInfo',
-  'cc_localShadowBias',
-]);
+// Engine-provided builtin uniforms, grouped by the chunk that declares them
+// in editor/assets/chunks/builtin/uniforms/. The compiled glsl1 has these
+// expanded as bare uniforms — Cocos's source effect compiler rejects bare
+// vector/matrix uniforms (EFX2201). We strip them here and emit the matching
+// `#include <builtin/uniforms/...>` so the editor's preprocessor re-supplies
+// the declarations from the engine's chunk library. Names collected from the
+// engine's *.chunk files (Cocos Creator 3.8.x).
+const BUILTIN_CHUNKS = {
+  'cc-global': [
+    'cc_cameraPos', 'cc_exposure', 'cc_screenSize', 'cc_nativeSize', 'cc_screenScale',
+    'cc_time', 'cc_mainLitDir', 'cc_mainLitColor', 'cc_ambientSky', 'cc_ambientGround',
+    'cc_fogColor', 'cc_fogBase', 'cc_fogAdd', 'cc_nearFar', 'cc_viewPort',
+    'cc_matView', 'cc_matViewInv', 'cc_matProj', 'cc_matProjInv',
+    'cc_matViewProj', 'cc_matViewProjInv',
+    'cc_surfaceTransform', 'cc_probeInfo', 'cc_debug_view_mode',
+  ],
+  'cc-local': [
+    'cc_matWorld', 'cc_matWorldIT', 'cc_lightingMapUVParam', 'cc_localShadowBias',
+    'cc_reflectionProbeData1', 'cc_reflectionProbeData2',
+    'cc_reflectionProbeBlendData1', 'cc_reflectionProbeBlendData2',
+  ],
+  'cc-shadow': [
+    'cc_matLightView', 'cc_matLightProj', 'cc_matLightInvProj', 'cc_matLightViewProj',
+    'cc_shadowInvProjDepthInfo', 'cc_shadowProjDepthInfo', 'cc_shadowProjInfo',
+    'cc_shadowNFLSInfo', 'cc_shadowWHPBInfo', 'cc_shadowLPNNInfo',
+    'cc_shadowColor', 'cc_planarNDInfo',
+  ],
+  'cc-shadow-map': ['cc_shadowMap', 'cc_spotShadowMap'],
+  'cc-csm': [
+    'cc_matCSMViewProj', 'cc_csmViewDir0', 'cc_csmViewDir1', 'cc_csmViewDir2',
+    'cc_csmAtlas', 'cc_csmProjDepthInfo', 'cc_csmProjInfo', 'cc_csmSplitsInfo',
+  ],
+  'cc-forward-light': [
+    'cc_lightPos', 'cc_lightColor', 'cc_lightDir', 'cc_lightSizeRangeAngle',
+    'cc_lightBoundingSizeVS',
+  ],
+  'cc-light-map': ['cc_lightingMap'],
+  'cc-environment': ['cc_environment'],
+  'cc-diffusemap': ['cc_diffuseMap'],
+  'cc-skinning': [
+    'cc_jointAnimInfo', 'cc_jointTexture', 'cc_jointTextureInfo',
+    'cc_joints', 'cc_realtimeJoint',
+  ],
+  'cc-morph': [
+    'cc_PositionDisplacements', 'cc_NormalDisplacements', 'cc_TangentDisplacements',
+    'cc_displacementWeights', 'cc_displacementTextureInfo',
+  ],
+  'cc-sh': [
+    'cc_sh_linear_const_r', 'cc_sh_linear_const_g', 'cc_sh_linear_const_b',
+    'cc_sh_quadratic_r', 'cc_sh_quadratic_g', 'cc_sh_quadratic_b', 'cc_sh_quadratic_a',
+  ],
+  'cc-reflection-probe': [
+    'cc_reflectionProbeCubemap', 'cc_reflectionProbePlanarMap',
+    'cc_reflectionProbeDataMap', 'cc_reflectionProbeBlendCubemap',
+  ],
+  'cc-world-bound': ['cc_worldBoundCenter', 'cc_worldBoundHalfExtents'],
+};
+// Reverse map: cc_name → owning chunk basename
+const UNIFORM_TO_CHUNK = (() => {
+  const m = new Map();
+  for (const [chunk, names] of Object.entries(BUILTIN_CHUNKS)) {
+    for (const n of names) m.set(n, chunk);
+  }
+  return m;
+})();
 
 // Match `[layout(...)] uniform [highp|mediump|lowp] <type> <name>;` (single-line).
 // Only applies to non-sampler, non-block uniforms. Captures name in group 4.
@@ -332,7 +381,7 @@ function postProcessGlsl(src, shader) {
 
   const lines = src.split('\n');
   const out = [];
-  let usesBuiltin = false;
+  const usedChunks = new Set();
   for (const line of lines) {
     const m = line.match(BARE_UNIFORM_RE);
     if (m) {
@@ -340,11 +389,25 @@ function postProcessGlsl(src, shader) {
       const name = m[3];
       // Keep sampler*/image* declarations (samplers may stand alone in GLSL).
       if (/^sampler/.test(type) || /^image/.test(type)) { out.push(line); continue; }
-      // Drop builtin cc_* uniforms — the include will re-supply them.
-      if (BUILTIN_UNIFORMS.has(name) || name.startsWith('cc_')) { usesBuiltin = true; continue; }
+      // Drop builtin cc_* uniforms — the include will re-supply them. Pick
+      // the chunk that actually declares this name; fall back to cc-global
+      // for unknown cc_* names so something gets included rather than nothing.
+      if (name.startsWith('cc_')) {
+        usedChunks.add(UNIFORM_TO_CHUNK.get(name) || 'cc-global');
+        continue;
+      }
       // Drop user uniforms that the JSON declares inside a block — a
       // synthesized `uniform <Block> { ... };` will replace them.
       if (memberToBlock.has(name)) continue;
+    }
+    // Also catch cc_* references in code (function bodies) so we still pull
+    // in the chunk even when the bare-uniform pre-decl was already removed.
+    const refs = line.match(/\bcc_[A-Za-z0-9_]+/g);
+    if (refs) {
+      for (const r of refs) {
+        const chunk = UNIFORM_TO_CHUNK.get(r);
+        if (chunk) usedChunks.add(chunk);
+      }
     }
     out.push(line);
   }
@@ -358,7 +421,13 @@ function postProcessGlsl(src, shader) {
     return `uniform ${b.name} {\n${members}\n};`;
   });
   const header = [];
-  if (usesBuiltin) header.push('#include <builtin/uniforms/cc-global>');
+  // Stable order: cc-global first, then cc-local, then everything else
+  // alphabetically — matches what hand-authored Cocos effects typically do.
+  const ordered = [...usedChunks].sort((a, b) => {
+    const order = (n) => n === 'cc-global' ? 0 : n === 'cc-local' ? 1 : 2;
+    return order(a) - order(b) || a.localeCompare(b);
+  });
+  for (const chunk of ordered) header.push(`#include <builtin/uniforms/${chunk}>`);
   if (blockDecls.length) header.push(...blockDecls);
   if (!header.length) return out.join('\n');
 
