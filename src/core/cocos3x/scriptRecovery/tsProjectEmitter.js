@@ -145,7 +145,7 @@ async function emitTsProject(modules, context = {}) {
 
     // Cross-bundle rewrite: `from "./X"` where X isn't in this bundle but is
     // a unique file in some other bundle → `from "../<otherBundle>/X"`.
-    text = rewriteCrossBundleImports(text, bundle, bundleIndex);
+    text = rewriteCrossBundleImports(text, bundle, bundleIndex, mod.resolvedDeps);
 
     try {
       await mkdir(path.dirname(fsPath), { recursive: true });
@@ -221,9 +221,22 @@ function stableUuid(seed) {
  * Ambiguous names are left alone (keeps the symptom obvious vs. picking the
  * wrong sibling silently). `./` only — `../` paths are already explicit.
  */
-function rewriteCrossBundleImports(text, currentBundle, bundleIndex) {
+function rewriteCrossBundleImports(text, currentBundle, bundleIndex, resolvedDeps) {
   const here = bundleIndex.get(currentBundle);
-  return text.replace(/(from\s*["'])\.\/([^"'/]+)(["'])/g, (full, pre, name, post) => {
+  return text.replace(/(from\s*["'])(\.\/[^"']+)(["'])/g, (full, pre, spec, post) => {
+    // Resolver-driven rewrite (Layer 4.6) takes precedence: it has full
+    // export-inventory context, so even when a same-bundle file with the
+    // matching basename exists, the resolver may direct us to a different
+    // bundle whose candidate actually satisfies the importer's bindings
+    // (e.g. main/JMSystem → ../bundle/index for CryptoJS default).
+    if (resolvedDeps && resolvedDeps.has(spec)) {
+      return `${pre}${resolvedDeps.get(spec)}${post}`;
+    }
+    // Existing fallback: only rewrite bare `./X` when same-bundle has no
+    // file by that base name, but exactly one cross-bundle does.
+    const m = spec.match(/^\.\/([^/]+)$/);
+    if (!m) return full;
+    const name = m[1];
     if (here && here.has(name)) return full; // resolves locally
     let hit = null;
     let count = 0;

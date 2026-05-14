@@ -87,6 +87,27 @@ async function splitChunks(chunk) {
         dep: deps[s._index],
         bindings: s.bindings,
       }));
+      // Aggregate the module's own export inventory. The cross-bundle resolver
+      // (Layer 4.6) uses this to decide whether a same-name candidate in
+      // another bundle satisfies an importer's named-binding set. Three
+      // sources contribute:
+      //   (a) setter-level reexports (already parsed above)
+      //   (b) execute-body `_export("Name", ...)` and `_export({a:..,b:..})`
+      //       calls — common in barrel modules and ccclass declarations
+      //   (c) `default` flagged separately so resolver can match `import x from`
+      const exportsSet = new Set();
+      let hasDefault = false;
+      for (const s of setterBindings) {
+        for (const b of s.bindings) {
+          if (b.reexport && b.exported) {
+            if (b.exported === 'default') hasDefault = true;
+            else exportsSet.add(b.exported);
+          }
+        }
+      }
+      if (result.bodyAst && exportParam) {
+        collectExecuteBodyExports(result.bodyAst, exportParam, exportsSet, (isDefault) => { if (isDefault) hasDefault = true; });
+      }
       modules.push({
         name: modName,
         registerId,
@@ -94,6 +115,8 @@ async function splitChunks(chunk) {
         setterBindings,
         exportParam,
         contextParam,
+        exports: exportsSet,
+        hasDefault,
         ast: result.bodyAst,
         source,
         preminified,
@@ -287,3 +310,46 @@ function parseSetters(arrayExpr, exportParam) {
 }
 
 module.exports = { splitChunks };
+
+/**
+ * Walk the execute() body and aggregate `_export("Name", ...)` and
+ * `_export({a:..,b:..})` calls into the exports set. `default` is reported via
+ * the markDefault callback. Used by the cross-bundle resolver to know what a
+ * module actually exports beyond its setter-level re-exports.
+ */
+function collectExecuteBodyExports(bodyAst, exportParam, exportsSet, markDefault) {
+  function visit(node) {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'CallExpression' &&
+        node.callee && node.callee.type === 'Identifier' &&
+        node.callee.name === exportParam) {
+      const args = node.arguments || [];
+      // _export("Name", ...) — single named export
+      if (args.length >= 1 && args[0] && args[0].type === 'StringLiteral') {
+        if (args[0].value === 'default') markDefault(true);
+        else exportsSet.add(args[0].value);
+      }
+      // _export({ a: .., b: .. }) — bulk named export
+      else if (args.length === 1 && args[0] && args[0].type === 'ObjectExpression') {
+        for (const p of args[0].properties) {
+          if (p.type === 'ObjectProperty' && !p.computed) {
+            const k = p.key;
+            const name = k && k.type === 'Identifier' ? k.name
+              : (k && k.type === 'StringLiteral' ? k.value : null);
+            if (name) {
+              if (name === 'default') markDefault(true);
+              else exportsSet.add(name);
+            }
+          }
+        }
+      }
+    }
+    for (const key of Object.keys(node)) {
+      if (key === 'loc' || key === 'start' || key === 'end') continue;
+      const v = node[key];
+      if (Array.isArray(v)) for (const c of v) visit(c);
+      else if (v && typeof v === 'object' && v.type) visit(v);
+    }
+  }
+  visit(bodyAst);
+}
