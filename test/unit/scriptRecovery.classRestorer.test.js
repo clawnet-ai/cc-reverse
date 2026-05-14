@@ -108,6 +108,49 @@ describe('Layer 3: classRestorer', () => {
     expect(code).not.toMatch(/e\(n,\s*t\)/);
   });
 
+  it('rewrites loose-mode super.call/apply in constructor body to super(...)', async () => {
+    const src = `
+      var GameKeyMgr = function (n) {
+        function GameKeyMgr(e, i) {
+          var r;
+          (r = n.call(this, "ChangeKey", { key: i, add: e }) || this).data = undefined;
+          return r;
+        }
+        e(GameKeyMgr, n);
+        return GameKeyMgr;
+      }(BaseEvent);
+    `;
+    const ast = parse(src, { sourceType: 'module' });
+    const out = await restoreClasses(ast, { name: 'GameKeyMgr', preminified: true });
+    const code = generate(out).code;
+    expect(code).toMatch(/class\s+GameKeyMgr\s+extends\s+BaseEvent/);
+    expect(code).toMatch(/super\(\s*"ChangeKey"/);
+    expect(code).toMatch(/this\.data\s*=\s*undefined/);
+    expect(code).not.toMatch(/n\.call\(this/);
+  });
+
+  it('skips fold when outer name collides with sibling top-level declaration', async () => {
+    // Module already declares `let GameKeyMgr = {...}` later. Folding the IIFE
+    // into `class GameKeyMgr extends r` would produce a duplicate identifier.
+    const src = `
+      var GameKeyMgr = function (n) {
+        function GameKeyMgr() { return n.call(this) || this; }
+        e(GameKeyMgr, n);
+        return GameKeyMgr;
+      }(BaseEvent);
+      let GameKeyMgr2 = { stuff: 1 };
+      var GameKeyMgr = { other: 2 };
+    `;
+    const ast = parse(src, { sourceType: 'module' });
+    // Should NOT throw and should NOT collapse the IIFE (because outer name
+    // is later re-declared).
+    const out = await restoreClasses(ast, { name: 'GameKeyMgr', preminified: true });
+    const code = generate(out).code;
+    expect(code).not.toMatch(/class\s+GameKeyMgr/);
+    // IIFE may or may not still be there, but the import must remain syntactically valid.
+    expect(code).toContain('GameKeyMgr');
+  });
+
   it('passthrough on null ast', async () => {
     expect(await restoreClasses(null, { name: 'x' })).toBeNull();
   });

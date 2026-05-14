@@ -87,7 +87,21 @@ async function restoreClasses(ast, _mod) {
  *     compiled cocos scripts; can be added later if needed).
  */
 function foldExtendsIife(ast) {
-  traverse(ast, {
+  // Pre-scan top-level declarations to count name occurrences. Babel's
+  // traverse() throws "Duplicate declaration" eagerly during scope-build,
+  // before our visitors run, so we can't rely on per-node guards. Instead we
+  // collect every top-level declared identifier upfront; if a name appears
+  // more than once at top level, folding the IIFE for that name would create
+  // a redeclaration the engine refuses to load. Skip it.
+  const conflictNames = computeTopLevelConflicts(ast);
+
+  // Babel's scope-build can throw "Duplicate declaration" for AST that we
+  // produced earlier in the pipeline (e.g. when esmRebuilder emits both
+  // `export let X` and a sibling `var X`). Swallow the throw — the pre-scan
+  // above already prevents us from making the situation worse, and any IIFE
+  // we couldn't traverse simply stays in its current form.
+  try {
+    traverse(ast, {
     VariableDeclaration(path) {
       // Only handle top-level / block-level `var X = ...;` with a single declarator.
       const decls = path.node.declarations;
@@ -115,6 +129,12 @@ function foldExtendsIife(ast) {
       const { superExpr, fnBody, superParamName } = match;
       const members = buildClassMembers(fnBody, innerCtorName, superParamName, [helperIdx]);
       if (members === null) return; // structure didn't match expectations; skip
+
+      // Bail if the outer name collides with a sibling top-level declaration
+      // (e.g. `let GameKeyMgr = {...}` later in the module). Folding would
+      // produce a duplicate-identifier SyntaxError that the engine refuses to
+      // load. Better to leave the IIFE intact than to brick the whole module.
+      if (conflictNames.has(className)) return;
 
       const classDecl = t.classDeclaration(
         t.identifier(className),
@@ -154,6 +174,9 @@ function foldExtendsIife(ast) {
       path.node.callee = classExpr;
     },
   });
+  } catch (e) {
+    if (!/Duplicate declaration/.test(String(e && e.message))) throw e;
+  }
 }
 
 // Variant of matchExtendsIife for the anonymous case: the IIFE body declares
@@ -256,11 +279,13 @@ function buildClassMembers(fnBody, className, superParamName, skipIdxList) {
     // Constructor: `function ClassName(params) { body }`
     if (t.isFunctionDeclaration(stmt) && stmt.id && stmt.id.name === className) {
       if (isPureSuperForwarder(stmt.body, stmt.params, superParamName)) continue; // omit, default ctor suffices
+      const ctorBody = rewriteCtorBody(stmt.body, superParamName);
+      if (ctorBody === null) return null; // bail — emit nothing, keep IIFE intact
       const ctor = t.classMethod(
         'constructor',
         t.identifier('constructor'),
         stmt.params,
-        stmt.body,
+        ctorBody,
       );
       members.push(ctor);
       continue;
@@ -280,11 +305,12 @@ function buildClassMembers(fnBody, className, superParamName, skipIdxList) {
         t.isIdentifier(left.property)
       ) {
         if (t.isFunctionExpression(right)) {
+          const methodBody = rewriteMethodBody(right.body, superParamName, left.property.name);
           const method = t.classMethod(
             'method',
             t.identifier(left.property.name),
             right.params,
-            right.body,
+            methodBody,
           );
           members.push(method);
         }
@@ -296,6 +322,198 @@ function buildClassMembers(fnBody, className, superParamName, skipIdxList) {
     // anything else (helper var decls, etc.) — drop in MVP.
   }
   return members;
+}
+
+// Rewrite babel-loose constructor body:
+//   var r;
+//   (r = SUP.call(this, ...) || this).field = ...;
+//   return r;
+// into:
+//   super(...);
+//   this.field = ...;
+// Conservative: returns null (caller bails) when shape isn't recognized.
+function rewriteCtorBody(block, superParamName) {
+  const out = [];
+  let aliasName = null; // the `r` in `var r; (r = SUP.call(this,...)||this).x = ...;`
+
+  for (let i = 0; i < block.body.length; i++) {
+    const stmt = block.body[i];
+
+    // Skip `var r;` (alias declaration, no initializer)
+    if (t.isVariableDeclaration(stmt) && stmt.declarations.length === 1) {
+      const d = stmt.declarations[0];
+      if (t.isIdentifier(d.id) && !d.init) {
+        // Tentatively the alias; finalized when we see the assign-to-super pattern.
+        if (!aliasName) aliasName = d.id.name;
+        continue;
+      }
+    }
+
+    // Recognize the loose super call:
+    //   (alias = SUP.call(this, ARGS) || this).field = VALUE;   → super(ARGS); this.field = VALUE;
+    //   (alias = SUP.call(this, ARGS) || this);                 → super(ARGS);
+    //    alias = SUP.call(this, ARGS) || this;                  → super(ARGS);
+    //    SUP.call(this, ARGS);                                  → super(ARGS);
+    //    return SUP.call(this, ARGS) || this;                   → super(ARGS);
+    if (t.isExpressionStatement(stmt)) {
+      const e = stmt.expression;
+
+      // Trailing field write: (alias = ... || this).field = VALUE;
+      if (
+        t.isAssignmentExpression(e, { operator: '=' }) &&
+        t.isMemberExpression(e.left) &&
+        !e.left.computed &&
+        t.isIdentifier(e.left.property)
+      ) {
+        const obj = e.left.object;
+        const inner = matchAliasedSuperOr(obj, superParamName, aliasName);
+        if (inner) {
+          out.push(t.expressionStatement(t.callExpression(t.super(), inner.args)));
+          out.push(t.expressionStatement(t.assignmentExpression(
+            '=',
+            t.memberExpression(t.thisExpression(), e.left.property),
+            e.right,
+          )));
+          continue;
+        }
+      }
+
+      // Plain alias = ... || this;
+      const aliasOnly = matchAliasedSuperOr(e, superParamName, aliasName);
+      if (aliasOnly) {
+        out.push(t.expressionStatement(t.callExpression(t.super(), aliasOnly.args)));
+        continue;
+      }
+
+      // Bare SUP.call(this, ARGS);
+      const bare = matchSuperCall(e, superParamName);
+      if (bare) {
+        out.push(t.expressionStatement(t.callExpression(t.super(), bare)));
+        continue;
+      }
+
+      // Other: rewrite stray `aliasName.X` references → `this.X`.
+      out.push(rewriteAliasRefs(stmt, aliasName));
+      continue;
+    }
+
+    if (t.isReturnStatement(stmt)) {
+      // return alias;  → drop (implicit `this` after super())
+      // return SUP.call(this, ARGS) || this; → super(ARGS);
+      if (stmt.argument && t.isIdentifier(stmt.argument, { name: aliasName || '__never__' })) {
+        continue;
+      }
+      if (stmt.argument) {
+        const sc = matchAliasedSuperOr(stmt.argument, superParamName, aliasName);
+        if (sc) {
+          out.push(t.expressionStatement(t.callExpression(t.super(), sc.args)));
+          continue;
+        }
+        const bare = matchSuperCall(stmt.argument, superParamName);
+        if (bare) {
+          out.push(t.expressionStatement(t.callExpression(t.super(), bare)));
+          continue;
+        }
+      }
+      // Unrecognized return; bail.
+      return null;
+    }
+
+    // Other statements: rewrite alias refs and pass through.
+    out.push(rewriteAliasRefs(stmt, aliasName));
+  }
+
+  return t.blockStatement(out);
+}
+
+// Match `SUP.call(this, ...args)` or `SUP.apply(this, args)` → return the args
+// that should be forwarded as super(...).
+function matchSuperCall(node, superParamName) {
+  if (!t.isCallExpression(node)) return null;
+  const callee = node.callee;
+  if (!t.isMemberExpression(callee) || callee.computed) return null;
+  if (!t.isIdentifier(callee.object, { name: superParamName })) return null;
+  if (!t.isIdentifier(callee.property)) return null;
+  if (node.arguments.length < 1 || !t.isThisExpression(node.arguments[0])) return null;
+  if (callee.property.name === 'call') {
+    return node.arguments.slice(1);
+  }
+  if (callee.property.name === 'apply') {
+    if (node.arguments.length === 2) {
+      return [t.spreadElement(node.arguments[1])];
+    }
+  }
+  return null;
+}
+
+// Match `(alias = SUP.call(this, ARGS) || this)` shape (with or without alias).
+function matchAliasedSuperOr(node, superParamName, aliasName) {
+  let inner = node;
+  if (t.isAssignmentExpression(node, { operator: '=' }) && t.isIdentifier(node.left)) {
+    if (aliasName && node.left.name !== aliasName) return null;
+    inner = node.right;
+  }
+  if (t.isLogicalExpression(inner, { operator: '||' }) && t.isThisExpression(inner.right)) {
+    inner = inner.left;
+  }
+  const args = matchSuperCall(inner, superParamName);
+  if (!args) return null;
+  return { args };
+}
+
+// Replace every `alias.<X>` MemberExpression with `this.<X>` in-place.
+function rewriteAliasRefs(node, aliasName) {
+  if (!aliasName) return node;
+  // Light-weight in-place walk; avoids importing @babel/traverse for sub-trees.
+  const visit = (n) => {
+    if (!n || typeof n !== 'object') return;
+    if (Array.isArray(n)) { n.forEach(visit); return; }
+    if (n.type === 'MemberExpression' && n.object && n.object.type === 'Identifier' && n.object.name === aliasName) {
+      n.object = t.thisExpression();
+    }
+    for (const k of Object.keys(n)) {
+      if (k === 'loc' || k === 'start' || k === 'end' || k === 'leadingComments' || k === 'trailingComments') continue;
+      visit(n[k]);
+    }
+  };
+  visit(node);
+  return node;
+}
+
+// Rewrite a prototype method body: replace `SUP.prototype.X.call(this, args)` →
+// `super.X(args)`. Conservative; unknown shapes are left intact.
+function rewriteMethodBody(block, superParamName, _methodName) {
+  const visit = (n) => {
+    if (!n || typeof n !== 'object') return;
+    if (Array.isArray(n)) { n.forEach(visit); return; }
+    if (
+      n.type === 'CallExpression' &&
+      n.callee && n.callee.type === 'MemberExpression' && !n.callee.computed &&
+      n.callee.property && n.callee.property.type === 'Identifier' &&
+      (n.callee.property.name === 'call' || n.callee.property.name === 'apply') &&
+      n.callee.object && n.callee.object.type === 'MemberExpression' && !n.callee.object.computed &&
+      n.callee.object.property && n.callee.object.property.type === 'Identifier' &&
+      n.callee.object.object && n.callee.object.object.type === 'MemberExpression' && !n.callee.object.object.computed &&
+      n.callee.object.object.object && n.callee.object.object.object.type === 'Identifier' &&
+      n.callee.object.object.object.name === superParamName &&
+      n.callee.object.object.property && n.callee.object.object.property.name === 'prototype' &&
+      n.arguments.length >= 1 && n.arguments[0].type === 'ThisExpression'
+    ) {
+      const methodId = n.callee.object.property; // X
+      const isApply = n.callee.property.name === 'apply';
+      n.callee = t.memberExpression(t.super(), methodId);
+      n.arguments = isApply
+        ? (n.arguments.length === 2 ? [t.spreadElement(n.arguments[1])] : [])
+        : n.arguments.slice(1);
+      return;
+    }
+    for (const k of Object.keys(n)) {
+      if (k === 'loc' || k === 'start' || k === 'end' || k === 'leadingComments' || k === 'trailingComments') continue;
+      visit(n[k]);
+    }
+  };
+  visit(block);
+  return block;
 }
 
 function isPureSuperForwarder(blockBody, params, superParamName) {
@@ -390,6 +608,71 @@ function unwrapClassDecl(stmt) {
   if (t.isExportNamedDeclaration(stmt) && t.isClassDeclaration(stmt.declaration)) return stmt.declaration;
   if (t.isExportDefaultDeclaration(stmt) && t.isClassDeclaration(stmt.declaration)) return stmt.declaration;
   return null;
+}
+
+// True if any other top-level statement in the same Program declares `name`
+// (var/let/const, function, class, export-let, etc.). The current declarator
+// (`path`) itself is excluded.
+function hasSiblingDeclarationOfName(path, name) {
+  const program = path.findParent((p) => p.isProgram());
+  if (!program) return false;
+  const ownNode = path.node;
+  const body = program.node.body;
+  for (const stmt of body) {
+    if (stmt === ownNode) continue;
+    if (declarationDeclares(stmt, name, ownNode)) return true;
+  }
+  return false;
+}
+
+// Walk a Program and return the Set of top-level identifier names that are
+// declared more than once. We use this to suppress IIFE→class folds that
+// would create duplicate declarations the engine rejects with SyntaxError.
+function computeTopLevelConflicts(ast) {
+  const counts = new Map();
+  if (!ast || !ast.program || !Array.isArray(ast.program.body)) return new Set();
+  for (const stmt of ast.program.body) {
+    for (const name of declaredNames(stmt)) {
+      counts.set(name, (counts.get(name) || 0) + 1);
+    }
+  }
+  const dupes = new Set();
+  for (const [name, n] of counts) if (n > 1) dupes.add(name);
+  return dupes;
+}
+
+function declaredNames(stmt) {
+  if (!stmt) return [];
+  if (t.isClassDeclaration(stmt) && stmt.id) return [stmt.id.name];
+  if (t.isFunctionDeclaration(stmt) && stmt.id) return [stmt.id.name];
+  if (t.isVariableDeclaration(stmt)) {
+    const out = [];
+    for (const d of stmt.declarations) {
+      if (t.isIdentifier(d.id)) out.push(d.id.name);
+    }
+    return out;
+  }
+  if (t.isExportNamedDeclaration(stmt) && stmt.declaration) return declaredNames(stmt.declaration);
+  if (t.isExportDefaultDeclaration(stmt) && stmt.declaration) return declaredNames(stmt.declaration);
+  return [];
+}
+
+function declarationDeclares(stmt, name, exclude) {
+  if (!stmt || stmt === exclude) return false;
+  if (t.isClassDeclaration(stmt) && stmt.id && stmt.id.name === name) return true;
+  if (t.isFunctionDeclaration(stmt) && stmt.id && stmt.id.name === name) return true;
+  if (t.isVariableDeclaration(stmt)) {
+    for (const d of stmt.declarations) {
+      if (t.isIdentifier(d.id, { name })) return true;
+    }
+  }
+  if (t.isExportNamedDeclaration(stmt) && stmt.declaration) {
+    return declarationDeclares(stmt.declaration, name, exclude);
+  }
+  if (t.isExportDefaultDeclaration(stmt) && stmt.declaration) {
+    return declarationDeclares(stmt.declaration, name, exclude);
+  }
+  return false;
 }
 
 module.exports = { restoreClasses };
