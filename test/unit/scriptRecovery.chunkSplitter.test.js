@@ -37,4 +37,38 @@ describe('Layer 1: chunkSplitter', () => {
       { dep: 'cc', bindings: [{ local: '_decorator', imported: '_decorator' }, { local: 'Component', imported: 'Component' }] }
     ]);
   });
+
+  it('captures whole-namespace setter (`local = ns`) as namespace binding', async () => {
+    // Mirrors SQConfig.ts: each SQLevelN setter receives the entire module
+    // object (`function(t){ o=t }`) instead of a destructured property.
+    // Without namespace recognition, the binding is silently dropped.
+    const src = `
+      System.register("chunks:///_virtual/SQConfig.ts",["./SQLevel1.ts","./SQLevel2.ts"],
+        (function(e){var o,i;return{setters:[function(t){o=t},function(t){i=t}],
+          execute:function(){var m={1:o,2:i};}}}));
+    `;
+    const out = await splitChunks({ name: 'sq.js', source: src });
+    expect(out).toHaveLength(1);
+    expect(out[0].setterBindings).toEqual([
+      { dep: './SQLevel1.ts', bindings: [{ local: 'o', namespace: true }] },
+      { dep: './SQLevel2.ts', bindings: [{ local: 'i', namespace: true }] },
+    ]);
+  });
+
+  it('parses comma-list setter (SequenceExpression) into multiple bindings', async () => {
+    // Minified setter: `function(e){i=e.cclegacy,n=e.Vec2}` — one statement,
+    // two assignments comma-joined.
+    const src = `
+      System.register("chunks:///_virtual/X.ts",["cc"],
+        (function(e){var i,n;return{setters:[function(e){i=e.cclegacy,n=e.Vec2}],
+          execute:function(){}}}));
+    `;
+    const out = await splitChunks({ name: 'x.js', source: src });
+    expect(out[0].setterBindings).toEqual([
+      { dep: 'cc', bindings: [
+        { local: 'i', imported: 'cclegacy' },
+        { local: 'n', imported: 'Vec2' },
+      ] },
+    ]);
+  });
 });

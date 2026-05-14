@@ -168,17 +168,37 @@ function parseSetters(arrayExpr) {
     const bindings = [];
     if (paramName) {
       for (const stmt of fn.body.body) {
-        if (
-          t.isExpressionStatement(stmt) &&
-          t.isAssignmentExpression(stmt.expression) &&
-          t.isIdentifier(stmt.expression.left) &&
-          t.isMemberExpression(stmt.expression.right) &&
-          t.isIdentifier(stmt.expression.right.object, { name: paramName })
-        ) {
-          const local = stmt.expression.left.name;
-          const importedNode = stmt.expression.right.property;
-          const imported = t.isIdentifier(importedNode) ? importedNode.name : (t.isStringLiteral(importedNode) ? importedNode.value : local);
-          bindings.push({ local, imported });
+        if (!t.isExpressionStatement(stmt)) continue;
+        // Setter may be a comma-list of assignments: `function(t){o=t.A,n=t.B}`
+        // which parses as a SequenceExpression. Normalise to a flat list.
+        const exprs = t.isSequenceExpression(stmt.expression)
+          ? stmt.expression.expressions
+          : [stmt.expression];
+        for (const e of exprs) {
+          if (!t.isAssignmentExpression(e) || !t.isIdentifier(e.left)) continue;
+          // `local = ns.prop` — named import binding.
+          if (
+            t.isMemberExpression(e.right) &&
+            t.isIdentifier(e.right.object, { name: paramName })
+          ) {
+            const local = e.left.name;
+            const importedNode = e.right.property;
+            const imported = t.isIdentifier(importedNode)
+              ? importedNode.name
+              : (t.isStringLiteral(importedNode) ? importedNode.value : local);
+            bindings.push({ local, imported });
+            continue;
+          }
+          // `local = ns` — whole-namespace receiver (SystemJS hands the entire
+          // module exports object to the setter). In ESM this is a namespace
+          // import: `import * as local from 'dep'`. Without this case the
+          // binding is silently dropped, leaving `local` undefined in the
+          // execute body — observed for SQConfig.ts which receives every
+          // SQLevelN.ts module as a whole namespace.
+          if (t.isIdentifier(e.right, { name: paramName })) {
+            bindings.push({ local: e.left.name, namespace: true });
+            continue;
+          }
         }
       }
     }

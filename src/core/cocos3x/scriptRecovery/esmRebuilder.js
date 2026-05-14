@@ -30,10 +30,23 @@ async function rebuildEsm(ast, mod) {
 
   for (const setter of mod.setterBindings || []) {
     if (!setter.dep || !setter.bindings.length) continue;
-    const specifiers = setter.bindings.map((b) =>
-      t.importSpecifier(t.identifier(b.local), t.identifier(b.imported))
-    );
-    newBody.push(t.importDeclaration(specifiers, t.stringLiteral(normalizeDep(setter.dep))));
+    // Namespace bindings (`local = ns` setter shape) must be emitted as a
+    // separate `import * as local from '...'` declaration — ESM disallows
+    // mixing a namespace specifier with named specifiers in one statement.
+    const named = [];
+    for (const b of setter.bindings) {
+      if (b.namespace) {
+        newBody.push(t.importDeclaration(
+          [t.importNamespaceSpecifier(t.identifier(b.local))],
+          t.stringLiteral(normalizeDep(setter.dep))
+        ));
+      } else {
+        named.push(t.importSpecifier(t.identifier(b.local), t.identifier(b.imported)));
+      }
+    }
+    if (named.length) {
+      newBody.push(t.importDeclaration(named, t.stringLiteral(normalizeDep(setter.dep))));
+    }
   }
 
   const exported = new Set();

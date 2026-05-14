@@ -40,4 +40,22 @@ describe('Layer 2: esmRebuilder', () => {
     const result = await rebuildEsm(null, { name: 'x', deps: [], setterBindings: [] });
     expect(result).toBeNull();
   });
+
+  it('emits `import * as local` for namespace bindings', async () => {
+    // SQConfig.ts setter shape: `function(t){ o = t }` — whole module object.
+    const src = `
+      System.register("chunks:///_virtual/M.ts",["./Lv1.ts","./Lv2.ts","cc"],
+        function(e){var o,i,c;return{setters:[
+          function(t){o=t;},
+          function(t){i=t;},
+          function(t){c=t.cclegacy;}
+        ],execute:function(){var m={1:o,2:i};}};});
+    `;
+    const [mod] = await splitChunks({ name: 'm.js', source: src });
+    const ast = await rebuildEsm(mod.ast, mod);
+    const code = generate(ast).code;
+    expect(code).toMatch(/import\s*\*\s*as\s+o\s+from\s*['"]\.\/Lv1['"]/);
+    expect(code).toMatch(/import\s*\*\s*as\s+i\s+from\s*['"]\.\/Lv2['"]/);
+    expect(code).toMatch(/import\s*\{\s*cclegacy\s+as\s+c\s*\}\s*from\s*['"]cc['"]/);
+  });
 });
