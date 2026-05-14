@@ -271,6 +271,32 @@ function matchExtendsIife(initRaw, className) {
 function buildClassMembers(fnBody, className, superParamName, skipIdxList) {
   const members = [];
   const skip = new Set(skipIdxList || []);
+
+  // Pre-pass: detect prototype aliases declared inside the IIFE body, e.g.
+  //   var s = h.prototype;            (CryptoJS shape)
+  //   var p = ClassName.prototype, q = ClassName.prototype;
+  // Subsequent `s.m = function...` then assigns a prototype method without
+  // ever mentioning `ClassName.prototype` directly. Without this, those
+  // method assignments are silently dropped and we emit an empty `class X
+  // extends Y {}`, breaking the engine at runtime (e.g. MD5/SHA hashers).
+  const protoAliases = new Set();
+  for (let i = 0; i < fnBody.length - 1; i++) {
+    const stmt = fnBody[i];
+    if (!t.isVariableDeclaration(stmt)) continue;
+    for (const d of stmt.declarations) {
+      if (!t.isIdentifier(d.id) || !d.init) continue;
+      const init = d.init;
+      if (
+        t.isMemberExpression(init) &&
+        !init.computed &&
+        t.isIdentifier(init.object, { name: className }) &&
+        t.isIdentifier(init.property, { name: 'prototype' })
+      ) {
+        protoAliases.add(d.id.name);
+      }
+    }
+  }
+
   // Iterate the IIFE body skipping the trailing return and any helper-call indices.
   for (let i = 0; i < fnBody.length - 1; i++) {
     if (skip.has(i)) continue;
@@ -292,18 +318,25 @@ function buildClassMembers(fnBody, className, superParamName, skipIdxList) {
     }
 
     // Prototype assignment: `ClassName.prototype.<name> = <value>;`
+    //   or via a local alias: `var s = ClassName.prototype; s.<name> = <value>;`
     if (t.isExpressionStatement(stmt) && t.isAssignmentExpression(stmt.expression, { operator: '=' })) {
       const left = stmt.expression.left;
       const right = stmt.expression.right;
-      if (
+      const directProto =
         t.isMemberExpression(left) &&
         t.isMemberExpression(left.object) &&
         t.isIdentifier(left.object.object, { name: className }) &&
         t.isIdentifier(left.object.property, { name: 'prototype' }) &&
         !left.computed &&
         !left.object.computed &&
-        t.isIdentifier(left.property)
-      ) {
+        t.isIdentifier(left.property);
+      const aliasedProto =
+        t.isMemberExpression(left) &&
+        !left.computed &&
+        t.isIdentifier(left.object) &&
+        protoAliases.has(left.object.name) &&
+        t.isIdentifier(left.property);
+      if (directProto || aliasedProto) {
         if (t.isFunctionExpression(right)) {
           const methodBody = rewriteMethodBody(right.body, superParamName, left.property.name);
           const method = t.classMethod(
@@ -318,6 +351,24 @@ function buildClassMembers(fnBody, className, superParamName, skipIdxList) {
         continue;
       }
       // static assignments like `ClassName.foo = ...` — drop in MVP.
+    }
+
+    // Drop the `var alias = ClassName.prototype` declaration we already consumed
+    // in the pre-pass; otherwise it would fall through to "anything else" and be
+    // silently dropped (which is fine here, but doing it explicitly keeps the
+    // intent visible). We also drop multi-declarator forms entirely if all
+    // initializers point at the prototype — typical CryptoJS pattern.
+    if (t.isVariableDeclaration(stmt)) {
+      const allProtoAlias = stmt.declarations.every(
+        (d) =>
+          t.isIdentifier(d.id) &&
+          d.init &&
+          t.isMemberExpression(d.init) &&
+          !d.init.computed &&
+          t.isIdentifier(d.init.object, { name: className }) &&
+          t.isIdentifier(d.init.property, { name: 'prototype' }),
+      );
+      if (allProtoAlias && stmt.declarations.length > 0) continue;
     }
     // anything else (helper var decls, etc.) — drop in MVP.
   }

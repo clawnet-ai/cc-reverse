@@ -154,4 +154,30 @@ describe('Layer 3: classRestorer', () => {
   it('passthrough on null ast', async () => {
     expect(await restoreClasses(null, { name: 'x' })).toBeNull();
   });
+
+  it('captures prototype methods assigned via local proto-alias (CryptoJS shape)', async () => {
+    // Original CryptoJS-style emit: `var s = h.prototype; s._doReset = function(){...}`.
+    // Without alias awareness, classRestorer used to drop those methods and emit
+    // an empty `class h extends n {}`, which made downstream `n._createHelper(h)`
+    // crash at runtime because h had no _doReset / _doFinalize.
+    const src = `
+      var __extends = function(d, b){};
+      var h = (function (_super) {
+        __extends(h, _super);
+        function h() { return _super.apply(this, arguments) || this; }
+        var s = h.prototype;
+        s._doReset = function () { this._hash = 1; };
+        s._doProcessBlock = function (m, i) { return m[i]; };
+        return h;
+      }(Hasher));
+    `;
+    const ast = parse(src, { sourceType: 'module' });
+    const out = await restoreClasses(ast, { name: 'h' });
+    const code = generate(out).code;
+    expect(code).toMatch(/class\s+h\s+extends\s+Hasher/);
+    expect(code).toMatch(/_doReset\s*\(\s*\)/);
+    expect(code).toMatch(/_doProcessBlock\s*\(\s*m\s*,\s*i\s*\)/);
+    // The alias-decl must not survive
+    expect(code).not.toMatch(/var\s+s\s*=\s*h\.prototype/);
+  });
 });
