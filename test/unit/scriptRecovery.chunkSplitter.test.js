@@ -104,6 +104,31 @@ describe('Layer 1: chunkSplitter', () => {
     ]);
   });
 
+  it('aggregates exports / hasDefault from setter reexports and execute-body _export calls', async () => {
+    // Mixed barrel: re-exports `Foo` from setter, declares `Bar` and `default`
+    // in execute body via _export(). Resolver needs both forms to decide
+    // whether a candidate satisfies an importer's binding set.
+    const src = `
+      System.register("chunks:///_virtual/index.ts",["./A.ts"],
+        (function(e){var x;return{setters:[function(t){e("Foo",t.Bar)}],
+          execute:function(){e("Bar",x);e("default",{lib:1})}}}));
+    `;
+    const out = await splitChunks({ name: 'index.js', source: src });
+    expect(out[0].exports).toBeInstanceOf(Set);
+    expect([...out[0].exports].sort()).toEqual(['Bar', 'Foo']);
+    expect(out[0].hasDefault).toBe(true);
+  });
+
+  it('aggregates _export({a:..,b:..}) object-literal calls into exports set', async () => {
+    const src = `
+      System.register("chunks:///_virtual/barrel.ts",[],
+        (function(e){return{setters:[],execute:function(){e({alpha:1,beta:2})}}}));
+    `;
+    const out = await splitChunks({ name: 'b.js', source: src });
+    expect([...out[0].exports].sort()).toEqual(['alpha', 'beta']);
+    expect(out[0].hasDefault).toBe(false);
+  });
+
   it('parses comma-list setter (SequenceExpression) into multiple bindings', async () => {
     // Minified setter: `function(e){i=e.cclegacy,n=e.Vec2}` — one statement,
     // two assignments comma-joined.

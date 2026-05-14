@@ -6,6 +6,7 @@ const { restoreClasses: defaultRestore } = require('./classRestorer');
 const { applyCcclassNames: defaultNamer } = require('./ccclassNamer');
 const { inferFieldTypes: defaultInferer } = require('./typeInferer');
 const { normalizePropertyTypes: defaultPropTypeNorm } = require('./propertyTypeNormalizer');
+const { resolveCrossBundleDeps: defaultCrossBundleResolver } = require('./crossBundleResolver');
 const { emitTsProject: defaultEmitter } = require('./tsProjectEmitter');
 
 /**
@@ -25,6 +26,7 @@ async function runScriptRecoveryPipeline(input) {
   const namer = layers.ccclassNamer || defaultNamer;
   const inferer = layers.typeInferer || defaultInferer;
   const propTypeNorm = layers.propertyTypeNormalizer || defaultPropTypeNorm;
+  const crossBundleResolver = layers.crossBundleResolver || defaultCrossBundleResolver;
   const emitter = layers.tsProjectEmitter; // emitter is opt-in (engine wires it)
   const errors = [];
 
@@ -68,6 +70,17 @@ async function runScriptRecoveryPipeline(input) {
     modules = (await propTypeNorm(modules, context)) || modules;
   } catch (err) {
     errors.push({ layer: 'propertyTypeNormalizer', message: err.message });
+  }
+
+  // Layer 4.6: resolve cross-bundle deps by export-symbol satisfaction.
+  // Annotates each module with a `resolvedDeps` map; the emitter consults it
+  // before applying its regex-based fallback rewrite. Fixes the
+  // `main/JMSystem.ts → main/index.ts (RTExt barrel)` mis-resolution by
+  // routing it to `bundle/index.ts` (CryptoJS barrel with default export).
+  try {
+    crossBundleResolver(modules, context);
+  } catch (err) {
+    errors.push({ layer: 'crossBundleResolver', message: err.message });
   }
 
   let emit = null;
