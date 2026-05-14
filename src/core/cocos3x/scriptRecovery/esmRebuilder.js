@@ -175,6 +175,44 @@ async function rebuildEsm(ast, mod) {
     );
   }
 
+  // Inject a `_context` shim when the second factory parameter is referenced
+  // in the body — typically `<ctx>.meta.url` from CommonJS-via-cjs-loader
+  // vendor wrappers (clipper, tslib, fp.cjs). Map it to the ESM equivalent
+  // `import.meta.url` via a tiny const proxy. Without this the binding is
+  // undefined at module top-level and throws `ReferenceError`.
+  if (
+    mod && mod.contextParam &&
+    referencesIdentifier(program, mod.contextParam) &&
+    !declaresIdentifier(program, mod.contextParam)
+  ) {
+    // const <ctx> = { meta: { url: import.meta.url }, import: (s) => import(s) };
+    program.body.unshift(
+      t.variableDeclaration('const', [
+        t.variableDeclarator(
+          t.identifier(mod.contextParam),
+          t.objectExpression([
+            t.objectProperty(
+              t.identifier('meta'),
+              t.objectExpression([
+                t.objectProperty(
+                  t.identifier('url'),
+                  t.memberExpression(t.metaProperty(t.identifier('import'), t.identifier('meta')), t.identifier('url'))
+                ),
+              ])
+            ),
+            t.objectProperty(
+              t.identifier('import'),
+              t.arrowFunctionExpression(
+                [t.identifier('s')],
+                t.callExpression(t.import(), [t.identifier('s')])
+              )
+            ),
+          ])
+        ),
+      ])
+    );
+  }
+
   return ast;
 }
 

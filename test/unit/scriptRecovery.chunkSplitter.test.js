@@ -55,6 +55,19 @@ describe('Layer 1: chunkSplitter', () => {
     ]);
   });
 
+  it('captures contextParam (second factory param) for cjs-loader vendor wrappers', async () => {
+    // Vendor wrappers like clipper/tslib read `_context.meta.url`. The minified
+    // factory param name may be a single letter; splitter must record it so
+    // esmRebuilder can inject the import.meta.url shim.
+    const src = `
+      System.register("chunks:///_virtual/clipper.ts",[],
+        (function(e,t){var n=t.meta.url;return{setters:[],execute:function(){}}}));
+    `;
+    const out = await splitChunks({ name: 'clipper.js', source: src });
+    expect(out[0].exportParam).toBe('e');
+    expect(out[0].contextParam).toBe('t');
+  });
+
   it('parses comma-list setter (SequenceExpression) into multiple bindings', async () => {
     // Minified setter: `function(e){i=e.cclegacy,n=e.Vec2}` — one statement,
     // two assignments comma-joined.

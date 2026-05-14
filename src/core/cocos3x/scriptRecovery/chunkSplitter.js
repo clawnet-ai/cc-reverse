@@ -75,6 +75,13 @@ async function splitChunks(chunk) {
       const exportParam = (factory.params && factory.params[0] && t.isIdentifier(factory.params[0]))
         ? factory.params[0].name
         : null;
+      // Capture the second parameter (`_context`). SystemJS exposes
+      // `_context.meta.url` and `_context.import`; recovered modules from
+      // CommonJS-via-cjs-loader vendors (clipper, tslib, fp.cjs) read
+      // `_context.meta.url`. esmRebuilder shims this to `import.meta.url`.
+      const contextParam = (factory.params && factory.params[1] && t.isIdentifier(factory.params[1]))
+        ? factory.params[1].name
+        : null;
       const result = extractFactoryBody(factory);
       const setterBindings = result.setterBindings.map((s) => ({
         dep: deps[s._index],
@@ -86,6 +93,7 @@ async function splitChunks(chunk) {
         deps,
         setterBindings,
         exportParam,
+        contextParam,
         ast: result.bodyAst,
         source,
         preminified,
