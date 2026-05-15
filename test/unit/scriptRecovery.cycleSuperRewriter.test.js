@@ -61,11 +61,16 @@ describe('Layer 1.6: cycleSuperRewriter', () => {
     expect(Array.isArray(r.sccs)).toBe(true);
     const r2 = await deferCycleSuperClasses([go, ab, tm, sg], r.sccs, {});
     expect(r2.errors).toEqual([]);
-    // GO was rewritten: namespace import added, IIFE arg uses `|| class{}`,
-    // body refs to `t` rewritten to `__cycdep_ActionBase.ActionBase`.
+    // GO was rewritten:
+    //  - IIFE arg: `(__cycdep_ActionBase && __cycdep_ActionBase.ActionBase) || class {}`
+    //  - top-level body refs to `t` (e.g. `i(e, t)`) stay bare — they consume
+    //    the formal param which is already either real super or placeholder.
+    //  - method-body refs to `t` (e.g. `t.prototype.onTrigger.call(this)`) get
+    //    rewritten to `__cycdep_ActionBase.ActionBase` so they pick up the
+    //    real super at instance-method invocation time.
     const goCode = generate(go.ast);
-    expect(goCode).toMatch(/__cycdep_ActionBase\.ActionBase \|\| class \{\}/);
-    expect(goCode).toMatch(/i\(e, __cycdep_ActionBase\.ActionBase\)/);
+    expect(goCode).toMatch(/__cycdep_ActionBase && __cycdep_ActionBase\.ActionBase \|\| class \{\}/);
+    expect(goCode).toMatch(/i\(e, t\)/);
     expect(goCode).toMatch(/__cycdep_ActionBase\.ActionBase\.prototype\.onTrigger\.call\(this\)/);
     expect(goCode).toMatch(/queueMicrotask/);
     expect(goCode).toMatch(/Object\.setPrototypeOf\(GameOverAction, __cycdep_ActionBase\.ActionBase\)/);
@@ -92,9 +97,9 @@ describe('Layer 1.6: cycleSuperRewriter', () => {
   it('does not rewrite IIFE formal references in nested shadowing scopes', async () => {
     const aSrc = `
       _e("A", function (t) {
-        function e() { return t.call.apply(t, [this]); }
-        i(e, t);
-        function inner(t) { return t + 1; }   // shadow
+        function e() { return t.call.apply(t, [this]); }   // nested fn body
+        i(e, t);                                            // top-level
+        function inner(t) { return t + 1; }                 // shadow
         return e;
       }(s));
     `;
@@ -112,7 +117,9 @@ describe('Layer 1.6: cycleSuperRewriter', () => {
     const code = generate(a.ast);
     // Nested `function inner(t)` has its own `t` — must remain bare.
     expect(code).toMatch(/function inner\(t\)\s*\{\s*return t \+ 1;/);
-    // Outer formal references are rewritten.
-    expect(code).toMatch(/__cycdep_B\.B/);
+    // Top-level call `i(e, t)` consumes the IIFE formal directly — bare.
+    expect(code).toMatch(/i\(e, t\)/);
+    // Nested function body references the formal — rewritten to namespace.
+    expect(code).toMatch(/__cycdep_B\.B\.call\.apply\(__cycdep_B\.B/);
   });
 });

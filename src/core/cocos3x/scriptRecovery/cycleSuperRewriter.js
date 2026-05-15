@@ -139,10 +139,20 @@ function rewriteModuleSupers(mod, sccNames) {
   for (const match of matches) {
     const nsName = ensureNamespaceImport(mod, match.super);
     const importedId = t.memberExpression(t.identifier(nsName), t.identifier(match.super.imported));
-    // 1) Replace IIFE actual arg with `nsName.Imported || class {}`
+    // 1) Replace IIFE actual arg with `(nsName && nsName.Imported) || class {}`.
+    // The outer `nsName && ...` guard is essential: when this leaf is reached
+    // by a leaf-as-entry DFS path while the super dep is still in-progress
+    // (Cocos editor reload), the SystemJS setter for the dep has not run yet,
+    // so the namespace local itself is `undefined` (not an empty object). A
+    // bare `nsName.Imported` would throw before the `|| class {}` fallback
+    // could fire.
     match.callPath.node.arguments[0] = t.logicalExpression(
       '||',
-      t.memberExpression(t.identifier(nsName), t.identifier(match.super.imported)),
+      t.logicalExpression(
+        '&&',
+        t.identifier(nsName),
+        t.memberExpression(t.identifier(nsName), t.identifier(match.super.imported))
+      ),
       t.classExpression(null, null, t.classBody([]))
     );
     // 2) Rewrite all references to `formalName` inside the IIFE body to `nsName.Imported`.
@@ -224,10 +234,29 @@ function rewriteFormalReferences(iifePath, formalName, nsName, importedName) {
       // The IIFE itself owns the binding; only rewrite references whose
       // closest binding lives in the IIFE scope.
       if (binding && binding.scope !== iifePath.scope) return;
+      // The IIFE actual argument was rewritten to `(ns && ns.X) || class{}`,
+      // so the formal param `t` already holds either the real super or the
+      // placeholder class at module-init time — references at IIFE top level
+      // (e.g. `inheritsLoose(e, t)`, internal helper calls) work correctly
+      // as-is. Only rewrite references inside nested functions (method
+      // bodies, derived constructors, callbacks): those run at instance-
+      // method invocation time, which is after the microtask repair, so
+      // they should reach through the namespace and pick up the real
+      // class instead of staying closed over the placeholder.
+      if (!isInsideNestedFunction(p, iifePath)) return;
       p.replaceWith(t.memberExpression(t.identifier(nsName), t.identifier(importedName)));
       p.skip();
     },
   });
+}
+
+function isInsideNestedFunction(p, iifePath) {
+  let cur = p.parentPath;
+  while (cur && cur !== iifePath) {
+    if (cur.isFunction() || cur.isObjectMethod() || cur.isClassMethod()) return true;
+    cur = cur.parentPath;
+  }
+  return false;
 }
 
 function appendPrototypeChainRepair(mod, rewrites) {
