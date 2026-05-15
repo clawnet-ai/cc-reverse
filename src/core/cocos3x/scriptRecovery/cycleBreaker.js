@@ -82,17 +82,34 @@ async function breakCycles(modules, _context) {
     }
   }
 
+  // Cache classifyUsage results: traversing an AST per binding per pass
+  // is O(N · passes · ast-size) which is unacceptable on large bundles
+  // (slgq has 1k+ modules). The classification of a (module, localName)
+  // pair never changes, so memoize it once per run.
+  const classifyCache = new Map();
+  function cachedClassify(mod, local) {
+    const key = `${indexOf.get(mod)}|${local}`;
+    if (classifyCache.has(key)) return classifyCache.get(key);
+    const v = classifyUsage(mod.ast, local);
+    classifyCache.set(key, v);
+    return v;
+  }
+
   // Iterate: each pass breaks at most one runtime edge per SCC, then
-  // re-runs Tarjan. SCCs that share a runtime edge collapse on the first
-  // break; nested cycles inside a "super-SCC" need additional passes.
-  // We bound passes by the number of edges to guarantee termination.
-  const removedEdges = new Set();
+  // re-runs Tarjan. CRITICAL: rewriting an edge to namespace makes
+  // *symbol resolution* lazy, but does NOT remove the dep edge from the
+  // module graph — Cocos's SystemJS loader still post-order-executes
+  // every dep regardless of whether its bindings are named or namespace.
+  // So we must keep already-broken edges in the graph for further SCC
+  // analysis; otherwise Tarjan thinks the cycle is gone after the first
+  // break and skips the still-blocking init-time chains.
+  // The skip filter inside the per-SCC loop (`bindings.some(b =>
+  // b.namespace || b.reexport)`) prevents re-breaking the same edge.
+  // Bound passes by edge count to guarantee termination.
+  const brokenEdges = new Set();
   const maxPasses = adj.reduce((s, l) => s + l.length, 0) + 2;
   for (let pass = 0; pass < maxPasses; pass++) {
-    const liveAdj = adj.map((list, from) =>
-      list.filter((e) => !removedEdges.has(edgeKey(from, e.to, e.setter)))
-    );
-    const sccs = tarjan(liveAdj);
+    const sccs = tarjan(adj);
     if (process.env.CC_REVERSE_DEBUG_CYCLE && pass === 0) {
       for (const scc of sccs) {
         if (scc.length < 2) continue;
@@ -103,31 +120,45 @@ async function breakCycles(modules, _context) {
     for (const scc of sccs) {
       if (scc.length < 2) continue;
       const inScc = new Set(scc);
-      let broken = false;
+      let brokeAny = false;
+      // Break ALL runtime edges in this SCC in one pass. Since dep edges
+      // remain regardless of binding form, the SCC stays intact across
+      // breaks within a pass — so re-running Tarjan after each single
+      // break (the prior approach) was wasteful. We still need a final
+      // Tarjan re-run on the next pass only to fold any newly-formed
+      // smaller SCCs and to surface unbreakable residues.
       for (const i of scc) {
-        if (broken) break;
         const m = modules[i];
-        for (const e of liveAdj[i]) {
+        for (const e of adj[i]) {
           if (!inScc.has(e.to)) continue;
           const setter = e.setter;
+          const key = edgeKey(i, e.to, setter);
+          if (brokenEdges.has(key)) continue;
           const bindings = setter.bindings;
           if (!bindings || !bindings.length) continue;
           if (bindings.some((b) => b.reexport || b.namespace)) continue;
           const allRuntime = bindings.every((b) => {
             if (!b.local) return false;
-            return classifyUsage(m.ast, b.local) === 'runtime';
+            return cachedClassify(m, b.local) === 'runtime';
           });
           if (!allRuntime) continue;
           rewriteEdgeToNamespace(m, setter);
-          removedEdges.add(edgeKey(i, e.to, setter));
-          broken = true;
+          brokenEdges.add(key);
+          brokeAny = true;
           changedThisPass = true;
-          break;
         }
       }
-      if (!broken) {
+      if (!brokeAny) {
+        // Suppress when this SCC already had at least one edge broken in
+        // an earlier pass — the remaining init-time chain is the residue
+        // and the user can still inspect it via the eventual run-time
+        // namespace lookup. Only report SCCs that are truly stuck from
+        // the start (nothing inside them was ever rewritten).
+        const sccTouched = scc.some((from) =>
+          adj[from].some((e) => inScc.has(e.to) && brokenEdges.has(edgeKey(from, e.to, e.setter)))
+        );
+        if (sccTouched) continue;
         const names = scc.map((i) => modules[i] && modules[i].name).join(' ↔ ');
-        // Only report the first time we see this exact SCC composition.
         const sig = `unbreakable import cycle: ${names}`;
         if (!errors.some((er) => er.message === sig)) {
           errors.push({ layer: 'cycleBreaker', message: `${sig} (no edge has only runtime bindings)` });
