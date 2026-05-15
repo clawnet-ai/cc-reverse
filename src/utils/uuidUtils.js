@@ -46,7 +46,16 @@ const uuidUtils = {
             console.warn("解码 UUID 失败: 输入必须是字符串");
             return undefined;
         }
-        
+
+        // 23-char compressed form (Cocos 的 _RF.push uuid 形式),先转成 22-char
+        // 再走标准 base64 → 36-char dashed GUID 解码。
+        if (base64.length === 23) {
+            try {
+                const expanded = uuidUtils.original_uuid(base64);
+                if (expanded && expanded.length === 22) base64 = expanded;
+            } catch (_) { /* fall through */ }
+        }
+
         // 长度检查
         if (base64.length !== 22) {
             // 如果不是标准长度的 Base64 UUID，直接返回原值

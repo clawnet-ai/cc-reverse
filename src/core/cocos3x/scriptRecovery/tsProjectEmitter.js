@@ -304,11 +304,17 @@ async function writeTsconfig(root) {
  * @param {string} className recovered ccclass name (used for displayName)
  */
 function buildTsMeta(uuid, className) {
+  // Cocos editor's typescript importer expects a 36-char dashed GUID. If we
+  // emit the 22-char base64 short uuid (the form used inside SystemJS bundles),
+  // the editor rejects it on import and reassigns a fresh random GUID — that
+  // breaks every scene `__type__` that referenced the original short uuid.
+  const { uuidUtils } = require('../../../utils/uuidUtils');
+  const decodedUuid = uuidUtils.decodeUuid(uuid);
   return {
     ver: '4.0.21',
     importer: 'typescript',
     imported: true,
-    uuid,
+    uuid: decodedUuid,
     files: [],
     subMetas: {},
     userData: {
