@@ -269,7 +269,10 @@ async function writeAssetMeta(filePath, opts) {
     ver,
     importer,
     imported: true,
-    uuid,
+    // Cocos editor expects 36-char dashed GUID in .meta.uuid; emitting the
+    // 22-char short uuid causes the editor to reassign a fresh GUID on
+    // import, breaking every scene `__type__`/`__uuid__` reference.
+    uuid: uuidUtils.decodeUuid(uuid),
     files: [path.extname(filePath)],
     subMetas: {},
     userData,
@@ -1017,7 +1020,7 @@ async function writeMeta(outBase, uuid, className, wasCcon, packRef) {
   const metaPath = outBase + ext + '.meta';
   const meta = {
     ver: '1.2.7',
-    uuid,
+    uuid: uuidUtils.decodeUuid(uuid),
     importer: classToImporter(className),
     downloadMode: 0,
     duration: 0,

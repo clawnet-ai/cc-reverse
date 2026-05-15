@@ -580,10 +580,14 @@ function applyAssetRefs(ctx) {
     }
 
     if (target && keyName != null) {
+      // Same rationale as extractClassName: the editor expands .meta.uuid to
+      // the 36-char dashed GUID, so scene `__uuid__` references must also be
+      // expanded. decodeUuid is a no-op for any value that isn't 22 chars.
+      const expandedUuid = uuidUtils.decodeUuid(uuid);
       if (Array.isArray(target) && typeof keyName === 'number') {
-        target[keyName] = { __uuid__: uuid };
+        target[keyName] = { __uuid__: expandedUuid };
       } else {
-        target[keyName] = { __uuid__: uuid };
+        target[keyName] = { __uuid__: expandedUuid };
       }
     }
   }
@@ -633,15 +637,31 @@ function classNameAt(ctx, idx) {
 }
 
 function extractClassName(def) {
-  if (typeof def === 'string') return def;
+  if (typeof def === 'string') return decodeScriptUuidIfShort(def);
   if (Array.isArray(def)) {
     const head = def[CLASS_TYPE];
-    if (typeof head === 'string') return head;
+    if (typeof head === 'string') return decodeScriptUuidIfShort(head);
     // Already-resolved constructor (shouldn't happen on raw JSON).
     return null;
   }
-  if (def && typeof def === 'object' && def.name) return String(def.name);
+  if (def && typeof def === 'object' && def.name) return decodeScriptUuidIfShort(String(def.name));
   return null;
+}
+
+// Custom user-script classes are referenced by their 22-char base64 short
+// uuid (the same value `_RF.push(module, uuid, name)` registers). The Cocos
+// editor's typescript importer rewrites .meta.uuid into the 36-char dashed
+// GUID form, and class registration in the editor's runtime keys off that
+// expanded GUID. So scene `__type__` strings must also be expanded — otherwise
+// `js.getClassById(shortUuid)` returns undefined and "Script ... is missing
+// or invalid" fires. Built-in `cc.*` class ids must stay verbatim.
+const SHORT_UUID_RE = /^[A-Za-z0-9+/]{22,23}$/;
+function decodeScriptUuidIfShort(name) {
+  if (typeof name !== 'string') return name;
+  if (name.length !== 22 && name.length !== 23) return name;
+  if (name.startsWith('cc.')) return name;
+  if (!SHORT_UUID_RE.test(name)) return name;
+  return uuidUtils.decodeUuid(name);
 }
 
 function extractClassKeys(def) {
