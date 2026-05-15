@@ -146,6 +146,47 @@ describe('Layer 4: ccclassNamer', () => {
     expect(code).toMatch(/EventType:\s*GameKeyMgr/);
   });
 
+  it('dual class+instance export: class is renamed to its own export alias, not the singleton name', async () => {
+    // Mimics post-classRestorer state for files like STGameEnemySystem.ts where
+    // the original SystemJS pattern was:
+    //   var d = _export("_STGameEnemySystem", IIFE);
+    //   _export("STGameEnemySystem", new d);
+    // After esmRebuilder + classRestorer we get:
+    //   class d extends c {}
+    //   export { d as _STGameEnemySystem };
+    //   export let STGameEnemySystem = new d;
+    // _RF.push announces ccclass name `STGameEnemySystem` — the singleton.
+    // If renameClassId blindly renames `d` → `STGameEnemySystem`, both the
+    // class and the `export let STGameEnemySystem = new ...` collide and
+    // Cocos rejects the module with `Identifier already declared`.
+    // Correct behaviour: rename the class to its own export alias `_STGameEnemySystem`
+    // so the singleton keeps the bare public name.
+    const src = `
+      import { Component } from 'cc';
+      cclegacy._RF.push({}, "uuid-stge", "STGameEnemySystem", undefined);
+      class d extends Component { init() { return 1; } }
+      export { d as _STGameEnemySystem };
+      export let STGameEnemySystem = new d();
+    `;
+    const mod = makeModule(src, { name: 'STGameEnemySystem' });
+    const out = await applyCcclassNames([mod]);
+    expect(out[0].ccclassName).toBe('STGameEnemySystem');
+    const code = generate(out[0].ast).code;
+    // Class takes the alias name (matches SystemJS's `_export("_X", ...)` choice).
+    expect(code).toMatch(/class\s+_STGameEnemySystem\s+extends\s+Component/);
+    // Singleton keeps the bare public name.
+    expect(code).toMatch(/export\s+let\s+STGameEnemySystem\s*=\s*new\s+_STGameEnemySystem\(\)/);
+    // The named-export re-export becomes redundant — the class is exported by name.
+    // Either `export { _STGameEnemySystem }` directly or via `export class` is fine,
+    // but there must be no `export { _ as _STGameEnemySystem }` self-alias.
+    expect(code).not.toMatch(/export\s+\{\s*_STGameEnemySystem\s+as\s+_STGameEnemySystem\s*\}/);
+    // No double-declaration.
+    const matches = code.match(/\bSTGameEnemySystem\b/g) || [];
+    // Should appear: in singleton declaration LHS and (possibly) inside _RF/uuid map removal residue (none).
+    // We just assert there's no `class STGameEnemySystem` in the output.
+    expect(code).not.toMatch(/class\s+STGameEnemySystem\b/);
+  });
+
   it('passthrough: module without class is unchanged and has null fields', async () => {
     const mod = { name: 'plain', ast: parse('var x = 1;', { sourceType: 'module' }), deps: [], setterBindings: [], source: 'var x = 1;' };
     const out = await applyCcclassNames([mod]);
