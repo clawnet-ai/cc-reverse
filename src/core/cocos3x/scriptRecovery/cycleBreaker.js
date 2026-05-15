@@ -53,8 +53,9 @@ const traverse = require('@babel/traverse').default;
  */
 async function breakCycles(modules, _context) {
   const errors = [];
+  const sccs = [];
   if (!Array.isArray(modules) || modules.length === 0) {
-    return { errors };
+    return { errors, sccs };
   }
 
   const byName = new Map();
@@ -168,7 +169,18 @@ async function breakCycles(modules, _context) {
     if (!changedThisPass) break;
   }
 
-  return { errors };
+  // Re-run Tarjan one final time to capture residual SCCs (after all
+  // breakable runtime edges have been converted). The downstream
+  // cycleSuperRewriter consumes this to safely defer `extends` references
+  // that still create init-time deadlocks under leaf-as-entry post-order
+  // traversal (e.g. cocos editor independently importing every ccclass).
+  const finalSccs = tarjan(adj);
+  for (const scc of finalSccs) {
+    if (scc.length < 2) continue;
+    sccs.push(scc.map((i) => modules[i]).filter(Boolean));
+  }
+
+  return { errors, sccs };
 }
 
 function edgeKey(from, to, setter) {
