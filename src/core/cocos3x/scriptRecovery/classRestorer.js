@@ -514,21 +514,52 @@ function rewriteCtorBody(block, superParamName) {
 
 // Match `SUP.call(this, ...args)` or `SUP.apply(this, args)` → return the args
 // that should be forwarded as super(...).
+//
+// Also recognises Babel-loose rest-args expansion:
+//   SUP.call.apply(SUP, [this].concat(arrIdent))   →  [...arrIdent]
+// emitted alongside a `for (var n=arguments.length, args=new Array(n), i=0; i<n; i++) { args[i]=arguments[i]; }`
+// gathering loop. We don't validate the loop here — recognising the call shape
+// is enough to restore `super(...args)` semantics.
 function matchSuperCall(node, superParamName) {
   if (!t.isCallExpression(node)) return null;
   const callee = node.callee;
   if (!t.isMemberExpression(callee) || callee.computed) return null;
-  if (!t.isIdentifier(callee.object, { name: superParamName })) return null;
   if (!t.isIdentifier(callee.property)) return null;
-  if (node.arguments.length < 1 || !t.isThisExpression(node.arguments[0])) return null;
-  if (callee.property.name === 'call') {
-    return node.arguments.slice(1);
-  }
-  if (callee.property.name === 'apply') {
-    if (node.arguments.length === 2) {
+
+  // Direct shape: SUP.call(this, ...args) / SUP.apply(this, arrIdent)
+  if (t.isIdentifier(callee.object, { name: superParamName })) {
+    if (node.arguments.length < 1 || !t.isThisExpression(node.arguments[0])) return null;
+    if (callee.property.name === 'call') return node.arguments.slice(1);
+    if (callee.property.name === 'apply' && node.arguments.length === 2) {
       return [t.spreadElement(node.arguments[1])];
     }
+    return null;
   }
+
+  // Nested shape: SUP.call.apply(SUP, [this].concat(<arr>))
+  if (
+    callee.property.name === 'apply' &&
+    t.isMemberExpression(callee.object) && !callee.object.computed &&
+    t.isIdentifier(callee.object.object, { name: superParamName }) &&
+    t.isIdentifier(callee.object.property, { name: 'call' }) &&
+    node.arguments.length === 2 &&
+    t.isIdentifier(node.arguments[0], { name: superParamName })
+  ) {
+    const second = node.arguments[1];
+    // [this].concat(arr) — Babel loose rest-args expansion.
+    if (
+      t.isCallExpression(second) &&
+      t.isMemberExpression(second.callee) && !second.callee.computed &&
+      t.isIdentifier(second.callee.property, { name: 'concat' }) &&
+      t.isArrayExpression(second.callee.object) &&
+      second.callee.object.elements.length === 1 &&
+      t.isThisExpression(second.callee.object.elements[0]) &&
+      second.arguments.length === 1
+    ) {
+      return [t.spreadElement(second.arguments[0])];
+    }
+  }
+
   return null;
 }
 
