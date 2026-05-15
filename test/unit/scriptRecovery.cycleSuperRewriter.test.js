@@ -70,8 +70,12 @@ describe('Layer 1.6: cycleSuperRewriter', () => {
     expect(goCode).toMatch(/queueMicrotask/);
     expect(goCode).toMatch(/Object\.setPrototypeOf\(GameOverAction, __cycdep_ActionBase\.ActionBase\)/);
     expect(goCode).toMatch(/Object\.setPrototypeOf\(GameOverAction\.prototype, __cycdep_ActionBase\.ActionBase\.prototype\)/);
-    // The original named setter is preserved (we add a sibling namespace setter).
-    expect(go.setterBindings.find((s) => s.bindings.some((b) => b.namespace))).toBeDefined();
+    // The ActionBase setter is replaced in place with a single namespace
+    // binding — duplicating the dep would mis-align Cocos editor's setter
+    // walk against its deduped dep list.
+    const abSetters = go.setterBindings.filter((s) => s.dep === './ActionBase');
+    expect(abSetters).toHaveLength(1);
+    expect(abSetters[0].bindings).toEqual([{ local: '__cycdep_ActionBase', namespace: true }]);
   });
 
   it('does nothing for modules outside any SCC', async () => {
