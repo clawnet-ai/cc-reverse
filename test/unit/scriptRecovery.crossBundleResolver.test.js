@@ -120,6 +120,9 @@ describe('Layer 4.6: crossBundleResolver', () => {
       ],
     });
     resolveCrossBundleDeps([main, target, importer]);
+    // Both keys present so the emitter matches its post-strip text and
+    // any callers using the original dep string also resolve.
+    expect(importer.resolvedDeps.get('./index')).toBe('../bundle/index');
     expect(importer.resolvedDeps.get('./index.ts')).toBe('../bundle/index');
   });
 });
