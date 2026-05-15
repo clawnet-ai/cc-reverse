@@ -180,6 +180,59 @@ describe('Layer 1.5: cycleBreaker', () => {
     expect(code).toMatch(/__cycdep_B\.MainCom\.run\(\)/);
   });
 
+  it('breaks multiple edges in the same SCC across passes (dep edge survives rewrite)', async () => {
+    // Realistic shape from slgq: AB → TM (runtime), TM → SG (runtime),
+    // SG → AB (init: top-level table assignment), SG → GO (init), GO → AB (init: extends).
+    // After PR #32/#34, breaking only TM→SG removed it from the analysis
+    // graph and Tarjan thought the cycle was gone — but Cocos's SystemJS
+    // loader still post-orders all deps, so AB→TM stayed named and the
+    // post-order put GO before AB → undefined.prototype.
+    // Fix: keep already-broken edges in the graph for further SCC passes
+    // so AB→TM gets broken too.
+    const abSrc = `
+      class ABImpl { run() { return TM.fire(); } }
+    `;
+    const tmSrc = `
+      function loop() { for (var k in SG.actionMap) { console.log(k); } }
+    `;
+    const sgSrc = `
+      class SGImpl extends Cmp {}
+      const map = {};
+      map[1] = AB;
+      map[2] = GO;
+    `;
+    const goSrc = `
+      class GOImpl extends AB {}
+    `;
+
+    const ab = mkMod('AB', abSrc, ['./TM'], [
+      { dep: './TM', bindings: [{ local: 'TM', imported: 'TM' }] },
+    ]);
+    const tm = mkMod('TM', tmSrc, ['./SG'], [
+      { dep: './SG', bindings: [{ local: 'SG', imported: 'SG' }] },
+    ]);
+    const sg = mkMod('SG', sgSrc, ['./AB', './GO'], [
+      { dep: './AB', bindings: [{ local: 'AB', imported: 'AB' }] },
+      { dep: './GO', bindings: [{ local: 'GO', imported: 'GO' }] },
+    ]);
+    const go = mkMod('GO', goSrc, ['./AB'], [
+      { dep: './AB', bindings: [{ local: 'AB', imported: 'AB' }] },
+    ]);
+
+    const r = await breakCycles([ab, tm, sg, go], {});
+    // Both runtime edges should be broken — TM→SG and AB→TM.
+    expect(tm.setterBindings[0].bindings[0].namespace).toBe(true);
+    expect(ab.setterBindings[0].bindings[0].namespace).toBe(true);
+    // The init-time edges stay named (no breakable runtime binding).
+    expect(sg.setterBindings[0].bindings[0].namespace).toBeUndefined();
+    expect(sg.setterBindings[1].bindings[0].namespace).toBeUndefined();
+    expect(go.setterBindings[0].bindings[0].namespace).toBeUndefined();
+    // Reports residual init-time-only SCCs only if the SCC was never
+    // partially broken; here the cycle was at least partially broken so
+    // we should see no errors.
+    expect(r.errors).toEqual([]);
+  });
+
   it('does not touch namespace or reexport bindings', async () => {
     const a = mkMod('A', `B.x();`, ['./B'], [
       { dep: './B', bindings: [{ local: 'B', namespace: true }] },
