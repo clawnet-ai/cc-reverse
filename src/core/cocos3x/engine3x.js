@@ -29,6 +29,7 @@ const { rehydrateIFileData, rehydrateIPackedFileData } = require('./rehydrate');
 const { writeCocos2xProject, writeCocos3xProject } = require('./projectScaffold');
 const { RecoveryReport } = require('./recoveryReport');
 const { runScriptRecoveryPipeline, emitTsProject } = require('./scriptRecovery');
+const { resolveCrossBundleDeps } = require('./scriptRecovery/crossBundleResolver');
 const { transformEffectAsset } = require('./assetRecovery/effectTransformer');
 const generatorModule = require('@babel/generator');
 const generate = generatorModule.default || generatorModule;
@@ -1284,6 +1285,18 @@ async function recoverScriptsLayered(sourcePath, outputPath, verbose, options = 
     allErrors.push(...errors);
     for (const m of modules) m.bundle = baseName;
     allModules = allModules.concat(modules);
+  }
+
+  // Cross-bundle dep resolution must run AFTER every chunk's pipeline has
+  // produced its modules and `m.bundle` has been stamped. The per-chunk
+  // pipeline above only ever sees one chunk's modules, so the in-pipeline
+  // Layer-4.6 pass cannot evaluate cross-bundle candidates. Re-run the
+  // resolver here on the full module set to populate `mod.resolvedDeps` —
+  // the emitter consults it when rewriting `from "./X"` specifiers.
+  try {
+    resolveCrossBundleDeps(allModules);
+  } catch (err) {
+    allErrors.push({ layer: 'crossBundleResolver(global)', message: err.message });
   }
 
   // Layer 6: emit TS project if requested.

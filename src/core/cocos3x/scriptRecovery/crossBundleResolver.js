@@ -72,7 +72,15 @@ function resolveCrossBundleDeps(modules) {
         if (cand && satisfies(cand, needs)) matches.push(b);
       }
       if (matches.length === 1) {
-        mod.resolvedDeps.set(dep, `../${matches[0]}/${baseName}`);
+        // esmRebuilder strips .js/.mjs/.ts extensions before writing the import
+        // text, so the emitter sees `./X` regardless of whether the chunk's
+        // original dep was `./X.js`. Index resolvedDeps under the
+        // extension-less form so the emitter's lookup matches.
+        const key = `./${baseName}`;
+        mod.resolvedDeps.set(key, `../${matches[0]}/${baseName}`);
+        // Also keep the original dep string indexed for callers that pass
+        // pre-stripped specs unchanged.
+        if (key !== dep) mod.resolvedDeps.set(dep, `../${matches[0]}/${baseName}`);
       }
       // 0 or >1 matches: leave it; tsProjectEmitter's existing fallback
       // (or no rewrite) will keep behaviour unchanged.
