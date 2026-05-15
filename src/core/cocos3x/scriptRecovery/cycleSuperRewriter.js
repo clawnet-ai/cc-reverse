@@ -186,19 +186,27 @@ function ensureNamespaceImport(mod, superInfo) {
     const ns = s.bindings.find((b) => b.namespace);
     if (ns) return ns.local;
   }
-  // Otherwise mutate the matching setter's binding for this imported symbol
-  // to a namespace specifier. Other named bindings on the same setter are
-  // preserved as a sibling setter (we keep separate per-binding setters
-  // since SystemJS setters are per-dep but cycleBreaker already split by
-  // binding shape elsewhere). Simplest: leave the original setter, add a
-  // new one with namespace shape. esmRebuilder emits namespace imports as
-  // their own `import * as ns from "..."` statement so this is safe.
+  // Mutate IN PLACE: replace this dep's setter bindings with a single
+  // namespace specifier. We must NOT push a sibling setter for the same
+  // dep — Cocos editor's SystemJS dep-list dedupes per module specifier
+  // but the executor still walks setters by index, so a duplicate dep
+  // emits a "ghost" setter that gets fed an unrelated module's namespace
+  // (off-by-one alignment), causing
+  //   "Cannot read properties of undefined (reading 'ActionBase')".
+  // The original named local (e.g. `s`) had all its references already
+  // rewritten to `__cycdep_X.Imported` by rewriteFormalReferences, so it
+  // is safe to drop.
   const safe = (depBasename(superInfo.dep) || 'dep').replace(/[^A-Za-z0-9_]/g, '_');
   const nsName = makeUniqueIdent(mod, `__cycdep_${safe}`);
-  mod.setterBindings.push({
-    dep: superInfo.dep,
-    bindings: [{ local: nsName, namespace: true }],
-  });
+  const target = mod.setterBindings.find((s) => s.dep === superInfo.dep);
+  if (target) {
+    target.bindings = [{ local: nsName, namespace: true }];
+  } else {
+    mod.setterBindings.push({
+      dep: superInfo.dep,
+      bindings: [{ local: nsName, namespace: true }],
+    });
+  }
   return nsName;
 }
 
