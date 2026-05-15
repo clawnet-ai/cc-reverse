@@ -166,6 +166,10 @@ function classifyUsage(bodyAst, localName) {
       Identifier(p) {
         if (p.node.name !== localName) return;
         if (!p.isReferencedIdentifier()) return;
+        // Skip references shadowed by an inner binding (var/param/function/
+        // class declaration). These belong to local code, not the import.
+        const binding = p.scope.getBinding(localName);
+        if (binding) return;
         let cur = p.parentPath;
         let inFn = false;
         while (cur) {
@@ -231,6 +235,9 @@ function rewriteRefs(ast, localToImported, nsName) {
       Identifier(p) {
         if (!localToImported.has(p.node.name)) return;
         if (!p.isReferencedIdentifier()) return;
+        // Skip refs shadowed by an inner declaration — only rewrite truly
+        // free references that bind to the SystemJS setter local.
+        if (p.scope.getBinding(p.node.name)) return;
         const imported = localToImported.get(p.node.name);
         p.replaceWith(
           t.memberExpression(t.identifier(nsName), t.identifier(imported))

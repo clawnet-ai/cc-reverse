@@ -115,6 +115,71 @@ describe('Layer 1.5: cycleBreaker', () => {
     expect(code).toMatch(/__cycdep_TriggerActionMgr\.TriggerActionMgr\.fire/);
   });
 
+  it('does not rewrite identifiers shadowed by inner declarations (var/param/function)', async () => {
+    // The original SystemJS setter `function(e){ a = e.MainCom }` exposes
+    // `MainCom` via the local `a`. The execute() body usually has many
+    // unrelated `var a`, parameter `a`, for-loop `a`, etc. cycleBreaker
+    // must NOT rewrite those shadowed `a` refs into `__cycdep_MainCom.MainCom`.
+    const aSrc = `
+      var top = a.Inst;
+      function shadow1() {
+        for (var a = 1; a <= 3; a++) {
+          console.log(a);
+        }
+      }
+      function shadow2(a) { return a + 1; }
+      function freeUse() { return a.fire(); }
+    `;
+    const bSrc = `class C extends A {}`;
+    const a = mkMod('A', aSrc, ['./B'], [
+      { dep: './B', bindings: [{ local: 'a', imported: 'MainCom' }] },
+    ]);
+    const b = mkMod('B', bSrc, ['./A'], [
+      { dep: './A', bindings: [{ local: 'A', imported: 'A' }] },
+    ]);
+
+    const r = await breakCycles([a, b], {});
+    // The init-time `var top = a.Inst` makes the binding init-time, so the
+    // edge A→B is not breakable. cycleBreaker should report it but must not
+    // touch any of the shadowed `a` identifiers.
+    const code = generate(a.ast);
+    expect(code).toMatch(/for\s*\(var a = 1; a <= 3; a\+\+\)/);
+    expect(code).toMatch(/function shadow2\(a\)\s*\{\s*return a \+ 1;/);
+    // Free `a.Inst` and `a.fire()` are not rewritten because the edge was
+    // not chosen for breaking (init-time `var top = a.Inst` exists).
+    expect(code).toMatch(/var top = a\.Inst;/);
+    expect(code).toMatch(/return a\.fire\(\);/);
+  });
+
+  it('rewrites only free references when edge is breakable, leaving shadowed names intact', async () => {
+    // Pure-runtime edge with shadowing: only `a.fire()` and `a.run()` (free
+    // refs in nested fns) should rewrite; the shadowed `a` inside `shadow1`
+    // and `shadow2` must stay bare.
+    const aSrc = `
+      function shadow1() {
+        for (var a = 1; a <= 3; a++) { console.log(a); }
+      }
+      function shadow2(a) { return a + 1; }
+      function freeUse1() { return a.fire(); }
+      function freeUse2() { return a.run(); }
+    `;
+    const bSrc = `class C extends A {}`;
+    const a = mkMod('A', aSrc, ['./B'], [
+      { dep: './B', bindings: [{ local: 'a', imported: 'MainCom' }] },
+    ]);
+    const b = mkMod('B', bSrc, ['./A'], [
+      { dep: './A', bindings: [{ local: 'A', imported: 'A' }] },
+    ]);
+
+    const r = await breakCycles([a, b], {});
+    expect(r.errors).toEqual([]);
+    const code = generate(a.ast);
+    expect(code).toMatch(/for\s*\(var a = 1; a <= 3; a\+\+\)/);
+    expect(code).toMatch(/function shadow2\(a\)\s*\{\s*return a \+ 1;/);
+    expect(code).toMatch(/__cycdep_B\.MainCom\.fire\(\)/);
+    expect(code).toMatch(/__cycdep_B\.MainCom\.run\(\)/);
+  });
+
   it('does not touch namespace or reexport bindings', async () => {
     const a = mkMod('A', `B.x();`, ['./B'], [
       { dep: './B', bindings: [{ local: 'B', namespace: true }] },
