@@ -2,6 +2,7 @@
 
 const { splitChunks: defaultSplit } = require('./chunkSplitter');
 const { rebuildEsm: defaultRebuild } = require('./esmRebuilder');
+const { breakCycles: defaultCycleBreaker } = require('./cycleBreaker');
 const { restoreClasses: defaultRestore } = require('./classRestorer');
 const { applyCcclassNames: defaultNamer } = require('./ccclassNamer');
 const { inferFieldTypes: defaultInferer } = require('./typeInferer');
@@ -22,6 +23,7 @@ async function runScriptRecoveryPipeline(input) {
   const { chunks = [], layers = {}, context = {} } = input;
   const split = layers.chunkSplitter || defaultSplit;
   const rebuild = layers.esmRebuilder || defaultRebuild;
+  const cycleBreaker = layers.cycleBreaker || defaultCycleBreaker;
   const restore = layers.classRestorer || defaultRestore;
   const namer = layers.ccclassNamer || defaultNamer;
   const inferer = layers.typeInferer || defaultInferer;
@@ -38,6 +40,17 @@ async function runScriptRecoveryPipeline(input) {
     } catch (err) {
       errors.push({ layer: 'chunkSplitter', chunk: chunk.name, message: err.message });
     }
+  }
+
+  // Layer 1.5: detect SystemJS-style import cycles and break a single safe
+  // edge per SCC by converting it to a deferred namespace member access. Must
+  // run BEFORE esmRebuilder so it can mutate setterBindings + the pre-ESM
+  // execute body identifiers in one shot.
+  try {
+    const r = await cycleBreaker(modules, context);
+    if (r && Array.isArray(r.errors)) errors.push(...r.errors);
+  } catch (err) {
+    errors.push({ layer: 'cycleBreaker', message: err.message });
   }
 
   for (const m of modules) {
