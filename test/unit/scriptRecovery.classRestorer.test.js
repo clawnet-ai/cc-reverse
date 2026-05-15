@@ -151,6 +151,38 @@ describe('Layer 3: classRestorer', () => {
     expect(code).toContain('GameKeyMgr');
   });
 
+  it('rewrites Babel rest-args super.call.apply(SUP, [this].concat(args)) shape', async () => {
+    // Babel-loose output for `class X extends Y { constructor(...args){ super(...args); this.f = 1; } }`:
+    //   var X = function(_super){ function X(){ var _this;
+    //     for(var _len=arguments.length, args=new Array(_len), _key=0; _key<_len; _key++){ args[_key]=arguments[_key]; }
+    //     return (_this = _super.call.apply(_super, [this].concat(args)) || this).f = 1, _this;
+    //   } e(X,_super); return X; }(Base);
+    // Without rewrite, the IIFE collapses to `class X extends Y` but the body
+    // still references `_super` — which after IIFE removal is undefined and
+    // throws ReferenceError: Must call super constructor in derived class...
+    // Note: alias `t` has no `var t;` declaration in the body (it's hoisted
+    // by Babel to the outer factory or just elided when minified).
+    const src = `
+      var STGamePegSystem = function (n) {
+        function STGamePegSystem() {
+          for (var o = arguments.length, m = new Array(o), i = 0; i < o; i++) { m[i] = arguments[i]; }
+          (t = n.call.apply(n, [this].concat(m)) || this).pegCfgMap = {};
+          this.pegRoot = null;
+        }
+        e(STGamePegSystem, n);
+        return STGamePegSystem;
+      }(BaseRoundPhaseHandler);
+    `;
+    const ast = parse(src, { sourceType: 'module' });
+    const out = await restoreClasses(ast, { name: 'STGamePegSystem', preminified: true });
+    const code = generate(out).code;
+    expect(code).toMatch(/class\s+STGamePegSystem\s+extends\s+BaseRoundPhaseHandler/);
+    expect(code).toMatch(/super\(\s*\.\.\.\s*m\s*\)/);
+    expect(code).toMatch(/this\.pegCfgMap\s*=\s*\{\s*\}/);
+    expect(code).toMatch(/this\.pegRoot\s*=\s*null/);
+    expect(code).not.toMatch(/n\.call\.apply\(n/);
+  });
+
   it('passthrough on null ast', async () => {
     expect(await restoreClasses(null, { name: 'x' })).toBeNull();
   });
