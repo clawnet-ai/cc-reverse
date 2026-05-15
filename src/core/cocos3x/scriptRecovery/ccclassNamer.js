@@ -91,7 +91,97 @@ function extractCcclassDecoratorName(ast) {
   return name;
 }
 
+/**
+ * Detect the "dual class+instance export" SystemJS pattern:
+ *   class <classLocal> extends X {}
+ *   export { <classLocal> as _<newName> };
+ *   export let <newName> = new <classLocal>(...);
+ *
+ * If matched, rename the class to `_<newName>` (its own export alias) instead
+ * of `<newName>`, so the singleton keeps the bare public name. Returns the
+ * effective rename target (`_<newName>` if dual-export, else `newName`).
+ *
+ * Original SystemJS shape:
+ *   var d = _export("_X", IIFE_class); _export("X", new d);
+ * The class is the alias-named export (`_X`), the singleton is the bare name (`X`).
+ */
+function detectDualExportRenameTarget(ast, newName) {
+  if (!ast || !ast.program) return newName;
+  const aliasName = '_' + newName;
+  const body = ast.program.body;
+
+  // Find an `export let <newName> = new <localClass>(...)` and remember localClass.
+  let singletonClassLocal = null;
+  for (const stmt of body) {
+    if (!t.isExportNamedDeclaration(stmt)) continue;
+    const decl = stmt.declaration;
+    if (!t.isVariableDeclaration(decl)) continue;
+    for (const d of decl.declarations) {
+      if (!t.isIdentifier(d.id, { name: newName })) continue;
+      if (!d.init || !t.isNewExpression(d.init)) continue;
+      if (!t.isIdentifier(d.init.callee)) continue;
+      singletonClassLocal = d.init.callee.name;
+      break;
+    }
+    if (singletonClassLocal) break;
+  }
+  if (!singletonClassLocal) return newName;
+
+  // Find an `export { <singletonClassLocal> as _<newName> }` re-export.
+  let aliasReexportFound = false;
+  for (const stmt of body) {
+    if (!t.isExportNamedDeclaration(stmt)) continue;
+    if (stmt.declaration) continue;
+    for (const spec of stmt.specifiers || []) {
+      if (!t.isExportSpecifier(spec)) continue;
+      if (!t.isIdentifier(spec.local, { name: singletonClassLocal })) continue;
+      if (!t.isIdentifier(spec.exported, { name: aliasName })) continue;
+      aliasReexportFound = true;
+      break;
+    }
+    if (aliasReexportFound) break;
+  }
+  if (!aliasReexportFound) return newName;
+
+  // Confirm <singletonClassLocal> is a class at top level.
+  let isClass = false;
+  for (const stmt of body) {
+    if (t.isClassDeclaration(stmt) && stmt.id && stmt.id.name === singletonClassLocal) {
+      isClass = true; break;
+    }
+  }
+  if (!isClass) return newName;
+
+  // Drop the now-redundant `export { local as _newName }` — after we rename the
+  // class to `_newName`, the class declaration itself will export it by name.
+  for (let i = body.length - 1; i >= 0; i--) {
+    const stmt = body[i];
+    if (!t.isExportNamedDeclaration(stmt) || stmt.declaration) continue;
+    stmt.specifiers = (stmt.specifiers || []).filter((spec) => {
+      if (!t.isExportSpecifier(spec)) return true;
+      return !(
+        t.isIdentifier(spec.local, { name: singletonClassLocal }) &&
+        t.isIdentifier(spec.exported, { name: aliasName })
+      );
+    });
+    if (!stmt.specifiers.length && !stmt.source) body.splice(i, 1);
+  }
+
+  // Promote the class declaration to `export class _newName ...` so the alias
+  // remains exported after we redirect the rename target.
+  for (let i = 0; i < body.length; i++) {
+    const stmt = body[i];
+    if (t.isClassDeclaration(stmt) && stmt.id && stmt.id.name === singletonClassLocal) {
+      body[i] = t.exportNamedDeclaration(stmt, []);
+      break;
+    }
+  }
+
+  return aliasName;
+}
+
 function renameClassId(ast, newName) {
+  newName = detectDualExportRenameTarget(ast, newName);
   // First pass: if some other top-level binding already owns `newName`
   // (typical case: webcrack restored a sibling `export let GameKeyMgr = {
   // EventType: u, ...}` namespace alongside `var u = (IIFE)`), rename the
