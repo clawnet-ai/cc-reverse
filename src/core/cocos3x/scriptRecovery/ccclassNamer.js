@@ -21,7 +21,19 @@ async function applyCcclassNames(modules, _context) {
 
     if (!ccclassName) ccclassName = extractCcclassDecoratorName(mod.ast);
 
-    if (ccclassName) renameClassId(mod.ast, ccclassName);
+    let renamed = false;
+    if (ccclassName) renamed = renameClassId(mod.ast, ccclassName);
+
+    // ES5-IIFE class form (no ClassDeclaration to rename, e.g. `export default
+    // (..., ccclass(function(e){...}(Base)), ...)`). _RF.push gave us the
+    // ccclass name but `renameClassId` had nothing to bind it to. Inject the
+    // name as the first arg of the first bare ccclass call so Cocos can
+    // resolve scenes that reference this UUID. Without this, the ccclass
+    // registers as anonymous and `Can not find class '<uuid>'` fires at scene
+    // load.
+    if (ccclassName && !renamed) {
+      injectTopNameIntoFirstCcclassCall(mod.ast, ccclassName);
+    }
 
     mod.ccclassName = ccclassName || null;
     mod.uuid = uuid || null;
@@ -233,9 +245,11 @@ function renameClassId(ast, newName) {
     },
   });
 
+  let renamed = false;
   traverse(ast, {
     ClassDeclaration(p) {
-      if (!p.node.id || p.node.id.name === newName) return;
+      if (!p.node.id) return;
+      if (p.node.id.name === newName) { renamed = true; p.stop(); return; }
       const oldName = p.node.id.name;
       try {
         p.scope.rename(oldName, newName);
@@ -243,6 +257,36 @@ function renameClassId(ast, newName) {
         // ignore — fallback below sets the id directly
       }
       if (p.node.id && p.node.id.name === oldName) p.node.id.name = newName;
+      renamed = true;
+      p.stop();
+    },
+  });
+  return renamed;
+}
+
+// Walk the AST and inject `name` as the first argument of the first bare
+// ccclass call (callee = `ccclass` identifier, an alias of `_decorator.ccclass`,
+// or `*.ccclass` member expression). Used when _RF.push announced the ccclass
+// name but no `class X extends Y` declaration existed to receive it (the
+// recovered output is an ES5 `function(e){...}(Base)` IIFE wrapped in
+// `ccclass(...)`). Without this, the ccclass registers anonymously and Cocos
+// scenes fail with `Can not find class '<uuid>'`.
+function injectTopNameIntoFirstCcclassCall(ast, name) {
+  const aliases = collectCcclassAliases(ast);
+  let injected = false;
+  traverse(ast, {
+    CallExpression(p) {
+      if (injected) return;
+      const callee = p.node.callee;
+      const isAlias = t.isIdentifier(callee) && aliases.has(callee.name);
+      const isMember =
+        t.isMemberExpression(callee) &&
+        t.isIdentifier(callee.property, { name: 'ccclass' });
+      if (!isAlias && !isMember) return;
+      const args = p.node.arguments;
+      if (args.length > 0 && t.isStringLiteral(args[0])) { injected = true; return; }
+      args.unshift(t.stringLiteral(name));
+      injected = true;
       p.stop();
     },
   });

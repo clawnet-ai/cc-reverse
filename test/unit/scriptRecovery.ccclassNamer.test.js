@@ -223,9 +223,12 @@ describe('Layer 4: ccclassNamer', () => {
     expect(code).toMatch(/Q\(\s*"MyInner"/);
   });
 
-  it('does not re-name the top-level ccclass via inner-class pass', async () => {
-    // top-level `Foo` is named via _RF.push; if it's also `export { x as Foo }`,
-    // the inner pass must skip it (topName === exportedName).
+  it('injects ccclass name into ES5-IIFE form when _RF.push names a class with no ClassDeclaration', async () => {
+    // GameDrive.ts style: `_RF.push("GameDrive")` + `export default
+    // (..., he(function(e){...}(B)), ...)`. Without a `class X extends Y`
+    // declaration, the ccclass call stays anonymous and scene loads fail with
+    // `Can not find class '<uuid>'`. The fallback injects the name into the
+    // first bare ccclass call.
     const src = `
       import { _decorator } from 'cc';
       var Q = _decorator.ccclass;
@@ -236,7 +239,7 @@ describe('Layer 4: ccclassNamer', () => {
     const mod = makeModule(src, { name: 'Foo' });
     const out = await applyCcclassNames([mod]);
     const code = generate(out[0].ast).code;
-    expect(code).not.toMatch(/Q\(\s*"Foo"/);
+    expect(code).toMatch(/Q\(\s*"Foo"/);
   });
 
   it('passthrough: module without class is unchanged and has null fields', async () => {
