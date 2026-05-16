@@ -64,4 +64,127 @@ describe('Layer 4.5: propertyTypeNormalizer', () => {
   it('skips modules without ast safely', async () => {
     await expect(normalizePropertyTypes([{ ast: null }, null])).resolves.toBeTruthy();
   });
+
+  it('rewrites `type: [String|Number|Boolean]` to engine wrappers and adds cc imports', async () => {
+    const src = `
+      import { _decorator } from "cc";
+      var o = _decorator;
+      var $ = o.property;
+      var a = $({ type: [String], displayName: 'a' });
+      var b = $({ type: [Number] });
+      var c = $({ type: [Boolean] });
+    `;
+    const a = ast(src);
+    await normalizePropertyTypes([{ ast: a }]);
+    const code = generate(a).code;
+    expect(code).toMatch(/type:\s*\[CCString\]/);
+    expect(code).toMatch(/type:\s*\[CCFloat\]/);
+    expect(code).toMatch(/type:\s*\[CCBoolean\]/);
+    // Imports should be merged into the existing `from "cc"` declaration.
+    expect(code).toMatch(/import\s*\{[^}]*CCString[^}]*\}\s*from\s*['"]cc['"]/);
+    expect(code).toMatch(/CCFloat/);
+    expect(code).toMatch(/CCBoolean/);
+  });
+
+  it('leaves non-native array element types alone', async () => {
+    const src = `
+      var $ = o.property;
+      var x = $({ type: [SpriteAtlas] });
+    `;
+    const a = ast(src);
+    await normalizePropertyTypes([{ ast: a }]);
+    const code = generate(a).code;
+    expect(code).toMatch(/type:\s*\[SpriteAtlas\]/);
+    expect(code).not.toMatch(/CCString|CCFloat|CCBoolean/);
+  });
+
+  it('inserts a cc import declaration when none existed', async () => {
+    const src = `
+      var $ = o.property;
+      var a = $({ type: [String] });
+    `;
+    const a = ast(src);
+    await normalizePropertyTypes([{ ast: a }]);
+    const code = generate(a).code;
+    expect(code).toMatch(/import\s*\{\s*CCString\s*\}\s*from\s*["']cc["']/);
+  });
+
+  it('injects inferred `type:` into bare $() calls when fieldTypes provides one', async () => {
+    const src = `
+      var $ = o.property;
+      var Q = $();
+      t(H.prototype, "isUseTimeScale", [Q], { initializer: function () { return true; } });
+    `;
+    const a = ast(src);
+    await normalizePropertyTypes([{ ast: a, fieldTypes: { isUseTimeScale: 'boolean' } }]);
+    const code = generate(a).code;
+    expect(code).toMatch(/\$\(\{\s*type:\s*CCBoolean\s*\}\)/);
+    expect(code).toMatch(/CCBoolean.*from\s*["']cc["']/s);
+  });
+
+  it('injects inferred `type:` into $({...}) calls without a type entry', async () => {
+    const src = `
+      var $ = o.property;
+      var D = $({ displayName: '进场动画' });
+      t(N.prototype, "enterAnim", [D], { initializer: function () { return ""; } });
+    `;
+    const a = ast(src);
+    await normalizePropertyTypes([{ ast: a, fieldTypes: { enterAnim: 'string' } }]);
+    const code = generate(a).code;
+    expect(code).toMatch(/type:\s*CCString/);
+    expect(code).toMatch(/displayName:\s*['"]进场动画['"]/);
+  });
+
+  it('does not overwrite an existing `type:` entry', async () => {
+    const src = `
+      var $ = o.property;
+      var p = $({ type: SpriteAtlas });
+      t(N.prototype, "atlas", [p], {});
+    `;
+    const a = ast(src);
+    await normalizePropertyTypes([{ ast: a, fieldTypes: { atlas: 'string' } }]);
+    const code = generate(a).code;
+    expect(code).toMatch(/type:\s*SpriteAtlas/);
+    expect(code).not.toMatch(/CCString/);
+  });
+
+  it('leaves $() alone when fieldTypes has no entry or only `any`', async () => {
+    const src = `
+      var $ = o.property;
+      var Q = $();
+      t(H.prototype, "unknownField", [Q], {});
+    `;
+    const a = ast(src);
+    await normalizePropertyTypes([{ ast: a, fieldTypes: { unknownField: 'any' } }]);
+    const code = generate(a).code;
+    expect(code).toMatch(/\$\(\)/);
+    expect(code).not.toMatch(/CCString|CCFloat|CCBoolean/);
+  });
+
+  it('falls back to initializer literal when fieldTypes is missing the field', async () => {
+    const src = `
+      var $ = o.property;
+      var Q = $();
+      t(H.prototype, "isAuto", [Q], { initializer: function () { return false; } });
+    `;
+    const a = ast(src);
+    await normalizePropertyTypes([{ ast: a, fieldTypes: {} }]);
+    const code = generate(a).code;
+    expect(code).toMatch(/type:\s*CCBoolean/);
+  });
+
+  it('initializer fallback handles string and number return values', async () => {
+    const src = `
+      var $ = o.property;
+      var A = $();
+      var B = $();
+      t(H.prototype, "name", [A], { initializer: function () { return ""; } });
+      t(H.prototype, "speed", [B], { initializer: function () { return -1; } });
+    `;
+    const a = ast(src);
+    await normalizePropertyTypes([{ ast: a, fieldTypes: {} }]);
+    const code = generate(a).code;
+    expect(code).toMatch(/A = \$\(\{\s*type:\s*CCString\s*\}\)/);
+    expect(code).toMatch(/B = \$\(\{\s*type:\s*CCFloat\s*\}\)/);
+  });
 });
