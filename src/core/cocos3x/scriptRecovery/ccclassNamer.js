@@ -28,6 +28,15 @@ async function applyCcclassNames(modules, _context) {
     if (uuid && ccclassName) {
       mod.uuidMap = { [uuid]: { className: ccclassName, moduleName: mod.name } };
     }
+
+    // Inner anonymous ccclasses: when the original chunk emitted
+    // `_export("Name", (..., ccclass(IIFE), ...))` for a nested class, the
+    // recovered file ends up with `var local = (..., ccclass(IIFE), ...)` plus
+    // `export { local as Name }` (or `export let Name = ...`), and the
+    // `ccclass()` call has no name argument. Cocos then warns
+    // "Can not serialize 'Outer.field' because the specified type is anonymous".
+    // We inject the exported name as the ccclass argument.
+    nameInnerCcclasses(mod.ast, ccclassName);
   }
   return modules;
 }
@@ -240,3 +249,114 @@ function renameClassId(ast, newName) {
 }
 
 module.exports = { applyCcclassNames };
+
+/**
+ * Inject the exported name as the first argument of `ccclass()` calls that
+ * were emitted with no name. The original chunk used SystemJS
+ * `_export("Name", expr)` to label inner classes; after esmRebuilder this
+ * becomes either `var local = expr; export { local as Name }` or
+ * `export let Name = expr`, but the inner `ccclass(IIFE)` call itself stays
+ * argument-less. Cocos serialization then treats the class as anonymous.
+ *
+ * Skips the top-level ccclass (already named via @ccclass("Foo") or _RF.push).
+ */
+function collectCcclassAliases(ast) {
+  const aliases = new Set(['ccclass']);
+  traverse(ast, {
+    VariableDeclarator(p) {
+      const init = p.node.init;
+      if (!init) return;
+      if (
+        t.isMemberExpression(init) &&
+        t.isIdentifier(init.property, { name: 'ccclass' }) &&
+        t.isIdentifier(p.node.id)
+      ) {
+        aliases.add(p.node.id.name);
+      }
+    },
+  });
+  return aliases;
+}
+
+function nameInnerCcclasses(ast, topName) {
+  if (!ast || !ast.program) return;
+  const body = ast.program.body;
+  const localToExported = new Map(); // local var name → public export name
+  const localToInit = new Map();      // local var name → init expression node
+  const ccclassAliases = collectCcclassAliases(ast);
+
+  for (const stmt of body) {
+    if (t.isVariableDeclaration(stmt)) {
+      for (const d of stmt.declarations) {
+        if (t.isIdentifier(d.id) && d.init) {
+          localToInit.set(d.id.name, d.init);
+        }
+      }
+    }
+    if (t.isExportNamedDeclaration(stmt)) {
+      // `export { local as Name }` (no declaration, has specifiers)
+      if (!stmt.declaration && stmt.specifiers) {
+        for (const spec of stmt.specifiers) {
+          if (
+            t.isExportSpecifier(spec) &&
+            t.isIdentifier(spec.local) &&
+            t.isIdentifier(spec.exported)
+          ) {
+            localToExported.set(spec.local.name, spec.exported.name);
+          }
+        }
+      }
+      // `export let Name = expr` — Name is both local and exported.
+      if (t.isVariableDeclaration(stmt.declaration)) {
+        for (const d of stmt.declaration.declarations) {
+          if (t.isIdentifier(d.id) && d.init) {
+            localToInit.set(d.id.name, d.init);
+            localToExported.set(d.id.name, d.id.name);
+          }
+        }
+      }
+    }
+  }
+
+  for (const [local, exportedName] of localToExported) {
+    if (exportedName === 'default') continue;
+    if (topName && exportedName === topName) continue;
+    const init = localToInit.get(local);
+    if (!init) continue;
+    injectCcclassName(init, exportedName, ccclassAliases);
+  }
+}
+
+// Walk `expr` and inject `name` into the first bare `ccclass(IIFE)` call we
+// find. Bare = first argument is not already a StringLiteral. We stop after
+// the first injection because each export label maps to one inner class.
+function injectCcclassName(node, name, aliases) {
+  let injected = false;
+  function isCcclassCallee(callee) {
+    if (t.isIdentifier(callee) && aliases.has(callee.name)) return true;
+    if (
+      t.isMemberExpression(callee) &&
+      t.isIdentifier(callee.property, { name: 'ccclass' })
+    ) return true;
+    return false;
+  }
+  function visit(n) {
+    if (injected || !n || typeof n !== 'object') return;
+    if (
+      n.type === 'CallExpression' &&
+      isCcclassCallee(n.callee) &&
+      (n.arguments.length === 0 || !t.isStringLiteral(n.arguments[0]))
+    ) {
+      n.arguments.unshift(t.stringLiteral(name));
+      injected = true;
+      return;
+    }
+    for (const k of Object.keys(n)) {
+      if (k === 'loc' || k === 'start' || k === 'end') continue;
+      const v = n[k];
+      if (Array.isArray(v)) for (const c of v) visit(c);
+      else if (v && typeof v === 'object' && v.type) visit(v);
+    }
+  }
+  visit(node);
+}

@@ -187,6 +187,58 @@ describe('Layer 4: ccclassNamer', () => {
     expect(code).not.toMatch(/class\s+STGameEnemySystem\b/);
   });
 
+  it('injects exported name into bare aliased ccclass(IIFE) call for inner classes', async () => {
+    // Mimics CombinationLock.ts: outer ccclass is named via _RF.push("CombinationLock"),
+    // but inner anonymous ccclass `j` (alias Q for ccclass) needs naming from
+    // the `export { j as PasswordNode }` label, else Cocos warns "anonymous".
+    const src = `
+      import { _decorator } from 'cc';
+      var s = _decorator;
+      var Q = s.ccclass;
+      var U = s.property;
+      cclegacy._RF.push({}, "uuid-combo", "CombinationLock", undefined);
+      var j = Q((function PasswordNodeCtor() { return function () {}; })());
+      export { j as PasswordNode };
+      @ccclass('CombinationLock')
+      class CombinationLock {}
+      cclegacy._RF.pop();
+    `;
+    const mod = makeModule(src, { name: 'CombinationLock' });
+    const out = await applyCcclassNames([mod]);
+    expect(out[0].ccclassName).toBe('CombinationLock');
+    const code = generate(out[0].ast).code;
+    expect(code).toMatch(/Q\(\s*"PasswordNode"/);
+  });
+
+  it('injects name into export let Name = ccclass(IIFE) form', async () => {
+    const src = `
+      import { _decorator } from 'cc';
+      var s = _decorator;
+      var Q = s.ccclass;
+      export let MyInner = Q((function () { return function () {}; })());
+    `;
+    const mod = makeModule(src, { name: 'mod' });
+    const out = await applyCcclassNames([mod]);
+    const code = generate(out[0].ast).code;
+    expect(code).toMatch(/Q\(\s*"MyInner"/);
+  });
+
+  it('does not re-name the top-level ccclass via inner-class pass', async () => {
+    // top-level `Foo` is named via _RF.push; if it's also `export { x as Foo }`,
+    // the inner pass must skip it (topName === exportedName).
+    const src = `
+      import { _decorator } from 'cc';
+      var Q = _decorator.ccclass;
+      cclegacy._RF.push({}, "u", "Foo", undefined);
+      var x = Q(function(){});
+      export { x as Foo };
+    `;
+    const mod = makeModule(src, { name: 'Foo' });
+    const out = await applyCcclassNames([mod]);
+    const code = generate(out[0].ast).code;
+    expect(code).not.toMatch(/Q\(\s*"Foo"/);
+  });
+
   it('passthrough: module without class is unchanged and has null fields', async () => {
     const mod = { name: 'plain', ast: parse('var x = 1;', { sourceType: 'module' }), deps: [], setterBindings: [], source: 'var x = 1;' };
     const out = await applyCcclassNames([mod]);
