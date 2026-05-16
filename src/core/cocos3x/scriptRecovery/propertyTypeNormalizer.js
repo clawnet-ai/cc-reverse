@@ -40,8 +40,9 @@ async function normalizePropertyTypes(modules) {
     if (!mod || !mod.ast) continue;
     try {
       const aliasNames = collectPropertyAliases(mod.ast);
-      stripNativeTypeProperty(mod.ast, aliasNames);
-      const wrappersUsed = rewriteArrayNativeTypes(mod.ast, aliasNames);
+      const ccAliasMap = collectCcImportAliases(mod.ast);
+      stripNativeTypeProperty(mod.ast, aliasNames, ccAliasMap);
+      const wrappersUsed = rewriteArrayNativeTypes(mod.ast, aliasNames, ccAliasMap);
       // Pass (c): inject inferred `type:` into bare `$()` / `$({...})` calls
       // that lack one. Cocos warns `You are explicitly specifying \`undefined\`
       // type to cc property "<name>" of cc class "<class>"` whenever a
@@ -85,7 +86,7 @@ function collectPropertyAliases(ast) {
   return out;
 }
 
-function stripNativeTypeProperty(ast, aliasNames) {
+function stripNativeTypeProperty(ast, aliasNames, ccAliasMap) {
   traverse(ast, {
     CallExpression(p) {
       if (!isPropertyCall(p.node.callee, aliasNames)) return;
@@ -100,7 +101,7 @@ function stripNativeTypeProperty(ast, aliasNames) {
           !prop.computed &&
           t.isIdentifier(prop.key, { name: 'type' }) &&
           t.isIdentifier(prop.value) &&
-          NATIVE_TYPE_IDS.has(prop.value.name)
+          NATIVE_TYPE_IDS.has(resolveCcName(prop.value.name, ccAliasMap))
         ) {
           dropped = true;
           continue;
@@ -136,7 +137,7 @@ function isPropertyCall(callee, aliasNames) {
 // constructor: `[CCString]` / `[CCFloat]` / `[CCBoolean]`. Returns the set
 // of wrapper identifiers that were introduced so the caller can ensure
 // matching `import { CCString } from "cc"` exists.
-function rewriteArrayNativeTypes(ast, aliasNames) {
+function rewriteArrayNativeTypes(ast, aliasNames, ccAliasMap) {
   const introduced = new Set();
   traverse(ast, {
     CallExpression(p) {
@@ -154,7 +155,8 @@ function rewriteArrayNativeTypes(ast, aliasNames) {
         if (prop.value.elements.length !== 1) continue;
         const el = prop.value.elements[0];
         if (!t.isIdentifier(el)) continue;
-        const wrapper = ARRAY_NATIVE_TO_WRAPPER[el.name];
+        const resolved = resolveCcName(el.name, ccAliasMap);
+        const wrapper = ARRAY_NATIVE_TO_WRAPPER[resolved];
         if (!wrapper) continue;
         prop.value.elements[0] = t.identifier(wrapper);
         introduced.add(wrapper);
@@ -206,6 +208,34 @@ function ensureCcImports(ast, wrappers) {
 }
 
 module.exports = { normalizePropertyTypes };
+
+// Build map of local-binding-name → imported-name for `import { X as a } from "cc"`.
+// Used to resolve `type: [a]` (where `a` is the local alias for `String`) back
+// to the real cc export name so we can apply the native→wrapper rewrite.
+function collectCcImportAliases(ast) {
+  const map = new Map();
+  const program = ast.program || ast;
+  if (!Array.isArray(program.body)) return map;
+  for (const stmt of program.body) {
+    if (!t.isImportDeclaration(stmt)) continue;
+    if (!t.isStringLiteral(stmt.source) || stmt.source.value !== 'cc') continue;
+    for (const spec of stmt.specifiers) {
+      if (
+        t.isImportSpecifier(spec) &&
+        t.isIdentifier(spec.imported) &&
+        t.isIdentifier(spec.local)
+      ) {
+        map.set(spec.local.name, spec.imported.name);
+      }
+    }
+  }
+  return map;
+}
+
+function resolveCcName(name, ccAliasMap) {
+  if (!ccAliasMap) return name;
+  return ccAliasMap.get(name) || name;
+}
 
 // Map an inferred-type string from typeInferer to a Cocos serialization type
 // identifier suitable as the `type:` decorator entry. Returns null when the

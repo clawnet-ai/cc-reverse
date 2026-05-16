@@ -86,6 +86,26 @@ describe('Layer 4.5: propertyTypeNormalizer', () => {
     expect(code).toMatch(/CCBoolean/);
   });
 
+  it('rewrites array native types when imported as aliases (`import { String as s } from "cc"`)', async () => {
+    const src = `
+      import { _decorator as c, String as s, Number as n, Boolean as b } from "cc";
+      var $ = c.property;
+      var d = $({ type: [s], displayName: 'ids' });
+      var e = $({ type: [n] });
+      var f = $({ type: [b] });
+      var g = $({ type: s });
+    `;
+    const a = ast(src);
+    await normalizePropertyTypes([{ ast: a }]);
+    const code = generate(a).code;
+    expect(code).toMatch(/type:\s*\[CCString\]/);
+    expect(code).toMatch(/type:\s*\[CCFloat\]/);
+    expect(code).toMatch(/type:\s*\[CCBoolean\]/);
+    // Scalar aliased `type: s` should also be dropped (cocos auto-infers).
+    expect(code).not.toMatch(/type:\s*s\b/);
+    expect(code).toMatch(/import\s*\{[^}]*CCString[^}]*\}\s*from\s*['"]cc['"]/);
+  });
+
   it('leaves non-native array element types alone', async () => {
     const src = `
       var $ = o.property;
