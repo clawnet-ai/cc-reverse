@@ -1480,6 +1480,123 @@ async function writeRecoveryReport(outputPath, summary, sourcePath, report) {
   await writeFile(path.join(outputPath, 'RECOVERY_REPORT.md'), lines.join('\n'));
 }
 
+/**
+ * Build the `subMetas` map for an image asset's .meta from its sibling
+ * `@hash` sub-asset uuids. Cocos 3.x bundles split each image into:
+ *   <parentUuid>           — cc.ImageAsset (the raw jpg/png)
+ *   <parentUuid>@6c48a     — cc.Texture2D  (gpu wrapper)
+ *   <parentUuid>@f9941     — cc.SpriteFrame (atlas slice, optional)
+ * The editor expects all three to be declared in the parent image's
+ * subMetas map. Without an `f9941` entry the editor can't resolve
+ * `<parentUuid>@f9941` lookups even though the standalone file exists,
+ * and every `cc.Sprite._spriteFrame` reference in a scene 404s.
+ *
+ * `siblings` is an array of `{ hash, klass, doc }` collected by the
+ * caller while iterating the bundle's uuid list. `doc` is the parsed
+ * import document for the sibling (used to lift SpriteFrame fields).
+ */
+function buildImageSubMetas({ parentUuid, displayName, siblings }) {
+  const out = {};
+  for (const sib of siblings || []) {
+    if (sib.klass === 'cc.Texture2D' || sib.hash === '6c48a') {
+      out[sib.hash] = {
+        importer: 'texture',
+        uuid: `${parentUuid}@${sib.hash}`,
+        displayName,
+        id: sib.hash,
+        name: 'texture',
+        userData: {
+          wrapModeS: 'repeat',
+          wrapModeT: 'repeat',
+          minfilter: 'linear',
+          magfilter: 'linear',
+          mipfilter: 'none',
+          anisotropy: 0,
+          isUuid: true,
+          imageUuidOrDatabaseUri: parentUuid,
+          visible: false,
+        },
+        ver: '1.0.22',
+        imported: true,
+        files: ['.json'],
+        subMetas: {},
+      };
+    } else if (sib.klass === 'cc.SpriteFrame' || sib.hash === 'f9941') {
+      const content = extractSpriteFrameContent(sib.doc);
+      const texUuid = extractTextureSource(sib.doc) || `${parentUuid}@6c48a`;
+      const name = (content && content.name) || displayName;
+      const w = content && content.rect ? content.rect.width : 0;
+      const h = content && content.rect ? content.rect.height : 0;
+      const rawW = content && content.originalSize ? content.originalSize.width : w;
+      const rawH = content && content.originalSize ? content.originalSize.height : h;
+      const offX = content && content.offset ? content.offset.x : 0;
+      const offY = content && content.offset ? content.offset.y : 0;
+      const trimX = content && content.rect ? content.rect.x : 0;
+      const trimY = content && content.rect ? content.rect.y : 0;
+      const pivotX = content && content.pivot ? content.pivot.x : 0.5;
+      const pivotY = content && content.pivot ? content.pivot.y : 0.5;
+      const rotated = !!(content && content.rotated);
+      out[sib.hash] = {
+        importer: 'sprite-frame',
+        uuid: `${parentUuid}@${sib.hash}`,
+        displayName: name,
+        id: sib.hash,
+        name,
+        userData: {
+          atlasUuid: '',
+          rawTextureUuid: texUuid,
+          trimType: 'auto',
+          trimThreshold: 1,
+          rotated,
+          offsetX: offX,
+          offsetY: offY,
+          trimX,
+          trimY,
+          width: w,
+          height: h,
+          rawWidth: rawW,
+          rawHeight: rawH,
+          borderTop: 0,
+          borderBottom: 0,
+          borderLeft: 0,
+          borderRight: 0,
+          packable: true,
+          pixelsToUnit: 100,
+          pivotX,
+          pivotY,
+          meshType: 0,
+          isUuid: true,
+          imageUuidOrDatabaseUri: parentUuid,
+        },
+        ver: '1.0.6',
+        imported: true,
+        files: ['.json'],
+        subMetas: {},
+      };
+    }
+  }
+  return out;
+}
+
+function extractSpriteFrameContent(doc) {
+  if (!doc) return null;
+  // Rehydrated form: [{ __type__: 'cc.SpriteFrame', content: {...}, _textureSource: {...} }]
+  if (Array.isArray(doc) && doc.length > 0 && doc[0] && doc[0].content) {
+    return doc[0].content;
+  }
+  if (doc && doc.content) return doc.content;
+  return null;
+}
+
+function extractTextureSource(doc) {
+  if (!doc) return null;
+  if (Array.isArray(doc) && doc.length > 0 && doc[0] && doc[0]._textureSource) {
+    const t = doc[0]._textureSource;
+    if (t && typeof t === 'object' && typeof t.__uuid__ === 'string') return t.__uuid__;
+  }
+  return null;
+}
+
 module.exports = {
   reverseProject3x,
   discoverBundles,
@@ -1488,6 +1605,7 @@ module.exports = {
   resolveOutputPath,
   writeAssetMeta,
   writeRecoveryReport,
+  buildImageSubMetas,
   KLASS_TO_IMPORTER,
   detectProjectFlavor,
   stripDbPrefix,
