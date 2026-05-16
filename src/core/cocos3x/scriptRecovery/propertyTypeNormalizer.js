@@ -298,16 +298,23 @@ function fillMissingTypesFromFieldTypes(ast, aliasNames, fieldTypes) {
   if (decoratorToField.size === 0) return introduced;
 
   // For every `<dvar> = $(...)` or `var <dvar> = $(...)` form, see if dvar
-  // maps back to a known field. Prefer scene-observed type from fieldTypes;
-  // fall back to the initializer's literal default when fieldTypes has no
-  // entry (frequent for component-private scalars never touched in scenes).
+  // maps back to a known field. Only inject when the initializer is NOT a
+  // primitive literal — Cocos auto-infers cc.String/cc.Float/cc.Boolean from
+  // a primitive default, so an explicit `type:` becomes redundant and warns.
   function tryInject(dvarName, callNode) {
     if (!callNode || !t.isCallExpression(callNode)) return;
     if (!isPropertyCall(callNode.callee, aliasNames)) return;
     const hit = decoratorToField.get(dvarName);
     if (!hit) return;
+    // Cocos auto-infers the cc serialization type from a primitive initializer
+    // (`return ""` → cc.String, `return -1` → cc.Float, `return false` →
+    // cc.Boolean). Re-stating it via `type: CCString` triggers the "No needs
+    // to indicate the 'cc.String' attribute" warning. So: only inject when the
+    // initializer is NOT a primitive literal (missing initializer, or returns
+    // null / undefined / an object that the engine can't infer from).
+    if (hit.initializerType) return;
     let inferred = fieldTypes ? fieldTypes[hit.fieldName] : undefined;
-    if (!inferred || inferred === 'any') inferred = hit.initializerType;
+    if (!inferred || inferred === 'any') return;
     const decorator = fieldTypeToDecorator(inferred);
     if (!decorator) return;
 

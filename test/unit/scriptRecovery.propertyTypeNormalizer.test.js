@@ -109,11 +109,11 @@ describe('Layer 4.5: propertyTypeNormalizer', () => {
     expect(code).toMatch(/import\s*\{\s*CCString\s*\}\s*from\s*["']cc["']/);
   });
 
-  it('injects inferred `type:` into bare $() calls when fieldTypes provides one', async () => {
+  it('injects inferred `type:` into bare $() calls when fieldTypes provides one (no primitive initializer)', async () => {
     const src = `
       var $ = o.property;
       var Q = $();
-      t(H.prototype, "isUseTimeScale", [Q], { initializer: function () { return true; } });
+      t(H.prototype, "isUseTimeScale", [Q], { initializer: function () { return null; } });
     `;
     const a = ast(src);
     await normalizePropertyTypes([{ ast: a, fieldTypes: { isUseTimeScale: 'boolean' } }]);
@@ -122,11 +122,11 @@ describe('Layer 4.5: propertyTypeNormalizer', () => {
     expect(code).toMatch(/CCBoolean.*from\s*["']cc["']/s);
   });
 
-  it('injects inferred `type:` into $({...}) calls without a type entry', async () => {
+  it('injects inferred `type:` into $({...}) calls without a type entry (no primitive initializer)', async () => {
     const src = `
       var $ = o.property;
       var D = $({ displayName: '进场动画' });
-      t(N.prototype, "enterAnim", [D], { initializer: function () { return ""; } });
+      t(N.prototype, "enterAnim", [D], { initializer: function () { return null; } });
     `;
     const a = ast(src);
     await normalizePropertyTypes([{ ast: a, fieldTypes: { enterAnim: 'string' } }]);
@@ -161,7 +161,7 @@ describe('Layer 4.5: propertyTypeNormalizer', () => {
     expect(code).not.toMatch(/CCString|CCFloat|CCBoolean/);
   });
 
-  it('falls back to initializer literal when fieldTypes is missing the field', async () => {
+  it('does NOT inject `type:` when initializer returns a primitive literal (engine auto-infers)', async () => {
     const src = `
       var $ = o.property;
       var Q = $();
@@ -170,10 +170,11 @@ describe('Layer 4.5: propertyTypeNormalizer', () => {
     const a = ast(src);
     await normalizePropertyTypes([{ ast: a, fieldTypes: {} }]);
     const code = generate(a).code;
-    expect(code).toMatch(/type:\s*CCBoolean/);
+    expect(code).toMatch(/\$\(\)/);
+    expect(code).not.toMatch(/CCBoolean/);
   });
 
-  it('initializer fallback handles string and number return values', async () => {
+  it('does NOT inject `type:` even with fieldTypes when initializer is a primitive (avoids redundant decorator warning)', async () => {
     const src = `
       var $ = o.property;
       var A = $();
@@ -182,9 +183,8 @@ describe('Layer 4.5: propertyTypeNormalizer', () => {
       t(H.prototype, "speed", [B], { initializer: function () { return -1; } });
     `;
     const a = ast(src);
-    await normalizePropertyTypes([{ ast: a, fieldTypes: {} }]);
+    await normalizePropertyTypes([{ ast: a, fieldTypes: { name: 'string', speed: 'number' } }]);
     const code = generate(a).code;
-    expect(code).toMatch(/A = \$\(\{\s*type:\s*CCString\s*\}\)/);
-    expect(code).toMatch(/B = \$\(\{\s*type:\s*CCFloat\s*\}\)/);
+    expect(code).not.toMatch(/CCString|CCFloat/);
   });
 });
