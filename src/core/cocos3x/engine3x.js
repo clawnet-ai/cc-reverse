@@ -597,6 +597,15 @@ async function unpackBundle({ bundleDir, cfg: prebuiltCfg, cfgPath: prebuiltCfgP
   // to re-pack or debug.
   await copyFile(cfgPath, path.join(bundleOut, 'config.original.json'));
 
+  // Back-fill image .meta subMetas for any parent uuid that has @hash
+  // siblings in cfg.uuids. Without this, Cocos 3.8 editor 404s on
+  // `<parentUuid>@f9941` lookups even though the standalone file exists.
+  try {
+    await augmentImageSubMetas({ cfg, bundleOut });
+  } catch (err) {
+    logger.warn(`augmentImageSubMetas [${cfg.name}]: ${err.message}`);
+  }
+
   // Preserve the bundle's compiled user-script bundle (2.4+ ships this as
   // <bundle>/game.js or <bundle>/index.js). These are SystemJS megabundles
   // referencing engine internals (e.g. ../libs/um.js) — placing them inside
@@ -1597,6 +1606,107 @@ function extractTextureSource(doc) {
   return null;
 }
 
+/**
+ * Post-process pass over an unpacked bundle directory. For every parent
+ * image uuid that has `<short>@hash` siblings in `cfg.uuids`, rewrite the
+ * parent's `.jpg.meta` / `.png.meta` to declare them in `subMetas`. Needed
+ * because cc-reverse emits each sub-asset uuid as its own file but never
+ * back-fills the parent's meta — Cocos editor reads `<parentUuid>@hash`
+ * via the parent's subMetas, not by globbing.
+ *
+ * Walks `bundleOut` recursively to locate the on-disk parent image files
+ * (we don't know their relative path from `cfg` alone).
+ */
+async function augmentImageSubMetas({ cfg, bundleOut }) {
+  if (!cfg || !Array.isArray(cfg.uuids) || cfg.uuids.length === 0) return;
+  // Group uuids: parentShort -> [{hash, fullShortUuid}]
+  const parents = new Map();
+  for (const u of cfg.uuids) {
+    const at = u.indexOf('@');
+    if (at < 0) continue;
+    const parent = u.slice(0, at);
+    const hash = u.slice(at + 1);
+    if (!parents.has(parent)) parents.set(parent, []);
+    parents.get(parent).push({ hash, fullShortUuid: u });
+  }
+  if (parents.size === 0) return;
+
+  // Find every .meta on disk under bundleOut and index by short uuid in
+  // filename. The parent image files are emitted as `<long>.<ext>` (not
+  // short) because writeMeta runs `decodeUuid(uuid)` for the meta payload,
+  // but the on-disk basename is the long uuid via resolveOutputPath +
+  // _packed/<2>/<long>. We instead index by the meta's payload uuid which
+  // is always the long form.
+  const metaIndex = new Map(); // longUuid -> absolute meta path
+  async function walk(dir) {
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { await walk(full); continue; }
+      if (!e.name.endsWith('.meta')) continue;
+      try {
+        const m = JSON.parse(await fsp.readFile(full, 'utf-8'));
+        if (m && typeof m.uuid === 'string') metaIndex.set(m.uuid, full);
+      } catch { /* ignore */ }
+    }
+  }
+  await walk(bundleOut);
+
+  for (const [parentShort, children] of parents) {
+    const parentLong = uuidUtils.decodeUuid(parentShort);
+    const metaPath = metaIndex.get(parentLong);
+    if (!metaPath) continue;
+    // Look up each child's import doc on disk to lift sprite-frame fields.
+    const siblings = [];
+    for (const c of children) {
+      // Standalone @hash files are emitted under the short uuid filename
+      // (cc.SpriteFrame import doc lives at <short>@<hash>.json).
+      const dir = path.dirname(metaPath);
+      const docPath = path.join(dir, `${parentShort}@${c.hash}.json`);
+      let doc = null;
+      try { doc = JSON.parse(await fsp.readFile(docPath, 'utf-8')); } catch { /* optional */ }
+      // Heuristic class: 6c48a → Texture2D, f9941 → SpriteFrame; otherwise
+      // try to read it off the doc.
+      let klass = null;
+      if (c.hash === '6c48a') klass = 'cc.Texture2D';
+      else if (c.hash === 'f9941') klass = 'cc.SpriteFrame';
+      else if (Array.isArray(doc) && doc[0] && doc[0].__type__) klass = doc[0].__type__;
+      // Replace any short @ refs inside the doc with long-form (so the
+      // resulting subMetas userData.rawTextureUuid is the long uuid the
+      // editor stores).
+      const docLong = rewriteShortAtRefsToLong(doc, parentShort, parentLong);
+      siblings.push({ hash: c.hash, klass, doc: docLong });
+    }
+    const subMetas = buildImageSubMetas({
+      parentUuid: parentLong,
+      displayName: parentShort,
+      siblings,
+    });
+    if (Object.keys(subMetas).length === 0) continue;
+    try {
+      const meta = JSON.parse(await fsp.readFile(metaPath, 'utf-8'));
+      meta.subMetas = Object.assign({}, meta.subMetas || {}, subMetas);
+      await writeFile(metaPath, JSON.stringify(meta, null, 2));
+    } catch { /* best-effort */ }
+  }
+}
+
+function rewriteShortAtRefsToLong(node, parentShort, parentLong) {
+  if (!node || typeof node !== 'object') return node;
+  if (Array.isArray(node)) return node.map((n) => rewriteShortAtRefsToLong(n, parentShort, parentLong));
+  const out = {};
+  for (const k of Object.keys(node)) {
+    const v = node[k];
+    if (typeof v === 'string' && v.startsWith(`${parentShort}@`)) {
+      out[k] = `${parentLong}@${v.slice(parentShort.length + 1)}`;
+    } else {
+      out[k] = rewriteShortAtRefsToLong(v, parentShort, parentLong);
+    }
+  }
+  return out;
+}
+
 module.exports = {
   reverseProject3x,
   discoverBundles,
@@ -1606,6 +1716,7 @@ module.exports = {
   writeAssetMeta,
   writeRecoveryReport,
   buildImageSubMetas,
+  augmentImageSubMetas,
   KLASS_TO_IMPORTER,
   detectProjectFlavor,
   stripDbPrefix,
